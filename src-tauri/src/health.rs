@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gantry_proc::{ManagedCommand, Stdio};
+use gantry_proc::{ExitStatus, ManagedCommand, Stdio};
 use serde::Serialize;
 use specta::Type;
 use tokio::io::AsyncReadExt;
@@ -101,6 +101,8 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
     // Lives outside `run`, so output collected before a timeout isn't lost with the future.
     let output = Arc::new(Mutex::new(Vec::<u8>::new()));
     let buf = Arc::clone(&output);
+    let exited = Arc::new(Mutex::new(None::<ExitStatus>));
+    let exited_slot = Arc::clone(&exited);
     let run = async move {
         // Resolution and CreateProcess do blocking registry/filesystem work (a PATH entry on an
         // unreachable network share can stall for tens of seconds), so keep them off the async
@@ -139,6 +141,7 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
             }
         });
         let exit = child.wait().await?;
+        *exited_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(exit);
         // After exit: a launcher stub may have handed off to the real binary, which can take a
         // while (cold start, AV scan) to print. So keep waiting while nothing has been printed
         // (bounded by PROBE_TIMEOUT); once there is output, allow READ_GRACE for the rest, then
@@ -187,7 +190,8 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
                     status.state = ToolState::ShimOnly;
                     status.path = Some(shim.display().to_string());
                 }
-                _ => {}
+                // Failed after launch (e.g. the wait itself failed): still say what ran.
+                _ => status.path = launched.lock().unwrap_or_else(|p| p.into_inner()).take(),
             }
             status.error = Some(e.to_string());
         }
@@ -195,21 +199,35 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         Err(_) => {
             status.path = launched.lock().unwrap_or_else(|p| p.into_inner()).take();
             let printed = first_line(&output.lock().unwrap_or_else(|p| p.into_inner()));
-            match printed {
+            let exit = *exited.lock().unwrap_or_else(|p| p.into_inner());
+            let secs = PROBE_TIMEOUT.as_secs();
+            status.error = Some(match printed {
                 // It answered but then hung (e.g. a slow update check): usable, but say so.
-                Some(line) => {
+                Some(line) if looks_like_version(&line) => {
                     status.state = ToolState::Ok;
                     status.version = Some(line);
-                    status.error = Some(format!(
-                        "`{program} --version` printed a version but did not exit within {}s",
-                        PROBE_TIMEOUT.as_secs()
-                    ));
+                    format!(
+                        "`{program} --version` printed a version but did not exit within {secs}s"
+                    )
                 }
-                None => status.error = Some(format!("`{program} --version` timed out")),
-            }
+                // An error banner or other text, then a hang: not healthy.
+                Some(line) => format!("`{program} --version` printed `{line}` and did not exit"),
+                None if exit.is_some_and(|e| e.success()) => format!(
+                    "`{program} --version` exited without printing a version \
+                     (a leftover process kept its output open)"
+                ),
+                None => format!("`{program} --version` timed out"),
+            });
         }
     }
     status
+}
+
+/// Whether a line printed by `--version` plausibly is one (CLIs print e.g. `2.1.330 (Claude
+/// Code)`, `codex-cli 0.171.0`, `v24.18.1`, `git version 2.45.2`): it contains a digit.
+/// Guards against reporting an error banner as a healthy tool's version.
+fn looks_like_version(line: &str) -> bool {
+    line.bytes().any(|b| b.is_ascii_digit())
 }
 
 /// Whether anything other than whitespace has been printed yet.
@@ -253,6 +271,34 @@ mod tests {
             Some("claude 1.2.3"),
             "{status:?}"
         );
+    }
+
+    /// Review fix: an error banner followed by a hang is not a healthy tool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn banner_then_hang_is_not_reported_healthy() {
+        let script = "console.log('Error: config file is corrupt'); setInterval(() => {}, 1000);";
+        let status = super::probe("Banner", "node", &["-e", script]).await;
+        assert_eq!(status.state, super::ToolState::Failed, "{status:?}");
+        assert_eq!(status.version, None);
+        assert!(
+            status
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("config file is corrupt"))
+        );
+    }
+
+    #[test]
+    fn version_heuristic() {
+        for v in [
+            "2.1.330 (Claude Code)",
+            "codex-cli 0.171.0",
+            "v24.18.1",
+            "1.4.4",
+        ] {
+            assert!(super::looks_like_version(v), "{v}");
+        }
+        assert!(!super::looks_like_version("Error: failed to load config"));
     }
 
     /// Review fix: a CLI that prints its version and then hangs keeps its version.

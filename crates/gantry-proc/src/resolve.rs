@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
-    RegGetValueW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_EXPAND_SZ, REG_VALUE_TYPE, RRF_NOEXPAND,
+    RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
 };
 
 use crate::cmdline::env_key_cmp;
@@ -116,7 +116,12 @@ const MACHINE_ENV: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Env
 const USER_ENV: &str = "Environment";
 
 /// Reads a `REG_SZ`/`REG_EXPAND_SZ` value *unexpanded* (no trailing NUL).
-fn registry_value(root: HKEY, subkey: &str, name: &OsStr) -> Option<Vec<u16>> {
+/// A string read from the registry or environment, and whether it may contain `%VAR%`
+/// references to expand (only `REG_EXPAND_SZ` does; `REG_SZ` and already-expanded process
+/// environment values are literal, as Windows treats them).
+type VarValue = (Vec<u16>, bool);
+
+fn registry_value(root: HKEY, subkey: &str, name: &OsStr) -> Option<VarValue> {
     let subkey = wide_nul(OsStr::new(subkey));
     let value = wide_nul(name);
     let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
@@ -124,6 +129,7 @@ fn registry_value(root: HKEY, subkey: &str, name: &OsStr) -> Option<Vec<u16>> {
     // Retry on ERROR_MORE_DATA: the value can grow between calls (an installer editing PATH).
     for _ in 0..8 {
         let mut size_bytes = (buf.len() * 2) as u32;
+        let mut kind: REG_VALUE_TYPE = 0;
         // SAFETY: valid NUL-terminated strings; `buf` is writable for `size_bytes` bytes.
         let rc = unsafe {
             RegGetValueW(
@@ -131,7 +137,7 @@ fn registry_value(root: HKEY, subkey: &str, name: &OsStr) -> Option<Vec<u16>> {
                 subkey.as_ptr(),
                 value.as_ptr(),
                 flags,
-                std::ptr::null_mut(),
+                &mut kind,
                 buf.as_mut_ptr().cast(),
                 &mut size_bytes,
             )
@@ -140,7 +146,7 @@ fn registry_value(root: HKEY, subkey: &str, name: &OsStr) -> Option<Vec<u16>> {
             0 => {
                 let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
                 buf.truncate(len);
-                return Some(buf);
+                return Some((buf, kind == REG_EXPAND_SZ));
             }
             ERROR_MORE_DATA => buf = vec![0; (size_bytes as usize).div_ceil(2) + 64],
             _ => return None,
@@ -156,25 +162,36 @@ fn registry_value(root: HKEY, subkey: &str, name: &OsStr) -> Option<Vec<u16>> {
 /// is stale after an install: an installer that adds `NVM_SYMLINK` / `PNPM_HOME` and appends
 /// `%NVM_SYMLINK%` to PATH would otherwise leave a literal, unusable entry.
 ///
-/// Scoping matches Windows: the machine `Path` is expanded with system variables only, the user
-/// `Path` with user variables first, then system ones.
+/// Scoping follows Windows: the machine `Path` is expanded with system variables, the user
+/// `Path` with user variables first, then system ones. Gantry's own environment is the final
+/// fallback, needed for built-in dynamic variables that are not in either registry key
+/// (`SystemRoot`, `USERPROFILE`, `APPDATA`, ...). Approximation: for the machine `Path` that
+/// fallback can also supply a user-only variable Windows would leave unexpanded — harmless,
+/// since such an entry would otherwise be a literal `%VAR%` that is skipped anyway.
+///
+/// Only `REG_EXPAND_SZ` values are expanded (recursively); `REG_SZ` values and process
+/// environment values are used literally, as Windows does.
 fn registry_path(root: HKEY, subkey: &str) -> Option<OsString> {
-    let raw = registry_value(root, subkey, OsStr::new("Path"))?;
+    let (raw, expandable) = registry_value(root, subkey, OsStr::new("Path"))?;
+    if !expandable {
+        return Some(OsString::from_wide(&raw));
+    }
     let is_user = root == HKEY_CURRENT_USER;
     let lookup = |name: &OsStr| {
         is_user
             .then(|| registry_value(HKEY_CURRENT_USER, USER_ENV, name))
             .flatten()
             .or_else(|| registry_value(HKEY_LOCAL_MACHINE, MACHINE_ENV, name))
-            .or_else(|| std::env::var_os(name).map(|v| v.encode_wide().collect()))
+            .or_else(|| std::env::var_os(name).map(|v| (v.encode_wide().collect(), false)))
     };
     Some(OsString::from_wide(&expand_vars(&raw, &lookup, 4)))
 }
 
-/// Expands `%NAME%` references using `lookup`, recursing up to `depth` levels into values
-/// that are themselves `REG_EXPAND_SZ`. Unknown names stay literal (`%NAME%`) and scanning
-/// resumes at their closing `%`, as `ExpandEnvironmentStringsW` does.
-fn expand_vars(raw: &[u16], lookup: &dyn Fn(&OsStr) -> Option<Vec<u16>>, depth: u8) -> Vec<u16> {
+/// Expands `%NAME%` references using `lookup`, recursing up to `depth` levels into values that
+/// are themselves expandable (`REG_EXPAND_SZ`); literal values are inserted as-is. Unknown names
+/// stay literal (`%NAME%`) and scanning resumes at their closing `%`, as
+/// `ExpandEnvironmentStringsW` does.
+fn expand_vars(raw: &[u16], lookup: &dyn Fn(&OsStr) -> Option<VarValue>, depth: u8) -> Vec<u16> {
     const PCT: u16 = b'%' as u16;
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;
@@ -195,8 +212,8 @@ fn expand_vars(raw: &[u16], lookup: &dyn Fn(&OsStr) -> Option<Vec<u16>>, depth: 
             lookup(&OsString::from_wide(name))
         };
         match value {
-            Some(v) if depth > 0 => out.extend(expand_vars(&v, lookup, depth - 1)),
-            Some(v) => out.extend(v),
+            Some((v, true)) if depth > 0 => out.extend(expand_vars(&v, lookup, depth - 1)),
+            Some((v, _)) => out.extend(v),
             None => {
                 // Keep `%NAME` and let the closing `%` start the next candidate.
                 out.extend_from_slice(&raw[i..i + 1 + len]);
@@ -562,11 +579,12 @@ mod tests {
         assert_eq!(merged, OsString::from(r"C:\A;c:\b\;C:\C"));
     }
 
-    fn expand(raw: &str, vars: &[(&str, &str)]) -> String {
+    /// `(name, value, is REG_EXPAND_SZ)`.
+    fn expand(raw: &str, vars: &[(&str, &str, bool)]) -> String {
         let lookup = |name: &OsStr| {
             vars.iter()
-                .find(|(k, _)| OsStr::new(k).eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.encode_utf16().collect())
+                .find(|(k, _, _)| OsStr::new(k).eq_ignore_ascii_case(name))
+                .map(|(_, v, expandable)| (v.encode_utf16().collect(), *expandable))
         };
         let wide: Vec<u16> = raw.encode_utf16().collect();
         String::from_utf16(&expand_vars(&wide, &lookup, 4)).unwrap()
@@ -575,10 +593,12 @@ mod tests {
     #[test]
     fn expands_vars_from_injected_environment() {
         let vars = [
-            ("NVM_HOME", r"C:\nvm"),
-            ("NVM_SYMLINK", r"%NVM_HOME%\nodejs"), // REG_EXPAND_SZ referencing another var
-            ("LOOP", "%LOOP%"),
+            ("NVM_HOME", r"C:\nvm", false),
+            ("NVM_SYMLINK", r"%NVM_HOME%\nodejs", true), // REG_EXPAND_SZ referencing a var
+            ("LITERAL", r"C:\a%NVM_HOME%b", false),      // REG_SZ: '%' is literal
+            ("LOOP", "%LOOP%", true),
         ];
+        assert_eq!(expand("%LITERAL%", &vars), r"C:\a%NVM_HOME%b");
         assert_eq!(
             expand(r"%NVM_HOME%;%nvm_symlink%;C:\x", &vars),
             r"C:\nvm;C:\nvm\nodejs;C:\x"
