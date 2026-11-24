@@ -604,17 +604,22 @@ impl ManagedChild {
         // The main process is gone, but helpers it started (MCP servers, dev servers) may still
         // run in its job, holding ports and files (which would block `git worktree remove`).
         // A finished shutdown means the whole tree is gone.
+        // Reaping is best-effort: the main process's exit status is the result, and a reap
+        // failure must not turn a clean shutdown into an error (the job still kills the rest
+        // when its last handle closes).
         if self.job.active_processes().unwrap_or(1) > 0 {
             tracing::debug!(
                 pid = self.pid,
                 "shutdown ladder: reaping leftover descendants"
             );
-            self.kill_tree()?;
-            if !self.job.wait_until_empty(REAP_TIMEOUT).await? {
-                tracing::warn!(
-                    pid = self.pid,
-                    "descendants still alive after terminating job"
-                );
+            let reaped = match self.kill_tree() {
+                Ok(()) => self.job.wait_until_empty(REAP_TIMEOUT).await,
+                Err(e) => Err(e),
+            };
+            match reaped {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(pid = self.pid, "descendants alive after reaping"),
+                Err(e) => tracing::warn!(pid = self.pid, error = %e, "failed to reap descendants"),
             }
         }
         Ok(status)

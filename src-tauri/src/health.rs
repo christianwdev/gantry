@@ -135,7 +135,9 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
                 .unwrap_or_else(|p| p.into_inner())
                 .iter()
                 .any(|b| !b.is_ascii_whitespace());
-            if has_output && exited_at.elapsed() >= READ_GRACE {
+            // A failed exit is already the answer: don't wait for output a full PROBE_TIMEOUT
+            // (which would misreport "timed out" instead of the exit code).
+            if (has_output || !exit.success()) && exited_at.elapsed() >= READ_GRACE {
                 let _ = child.kill_tree();
                 let _ = tokio::time::timeout(KILL_GRACE, &mut reader).await;
                 break;

@@ -284,12 +284,21 @@ fn with_extra_ext(path: &Path, ext: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// `symlink_metadata` rather than `metadata`: App Execution Aliases under `WindowsApps` are
-/// zero-byte reparse points that `metadata`/`canonicalize` cannot follow, yet launch fine.
+/// Whether `path` is something `CreateProcessW` can launch as a file.
+///
+/// * Real symlinks / junctions (`is_symlink`) must resolve to a file: a dangling link or a
+///   junction to a directory is skipped so the search continues to the next PATH entry.
+/// * Other reparse points are accepted via `symlink_metadata`: App Execution Aliases under
+///   `WindowsApps` are zero-byte `IO_REPARSE_TAG_APPEXECLINK` files that `metadata` cannot
+///   follow, yet launch fine.
 fn is_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| !m.is_dir())
-        .unwrap_or(false)
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            std::fs::metadata(path).is_ok_and(|target| target.is_file())
+        }
+        Ok(m) => !m.is_dir(),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +403,64 @@ mod tests {
         let merged = merge_path_lists(&[list]);
         assert_eq!(merged, OsString::from(r#"C:\a;"C:\Tools;v2\bin";C:\b"#));
         assert_eq!(split_path_list(&merged).count(), 3);
+    }
+
+    #[test]
+    fn junctions_to_directories_are_skipped_but_exec_aliases_resolve() {
+        let root =
+            std::env::temp_dir().join(format!("gantry-proc-junction-{}", std::process::id()));
+        let (early, late, target) = (root.join("early"), root.join("late"), root.join("target"));
+        for d in [&early, &late, &target] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::copy(system32().join("cmd.exe"), late.join("tool.exe")).unwrap();
+        // A junction (no privilege needed) named like the program, pointing at a directory.
+        let status = crate::ManagedCommand::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(early.join("tool.exe"))
+            .arg(&target)
+            .spawn()
+            .unwrap();
+        drop(status);
+        // Wait for mklink (sync, no runtime needed for Stdio::Null).
+        for _ in 0..100 {
+            if early.join("tool.exe").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut search = early.clone().into_os_string();
+        search.push(";");
+        search.push(late.as_os_str());
+        let found = find_executable(OsStr::new("tool"), &search, None);
+        let _ = std::fs::remove_dir(early.join("tool.exe"));
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            found.as_ref().is_ok_and(|p| p.starts_with(&late)),
+            "junction should be skipped: {found:?}"
+        );
+
+        // App Execution Aliases (zero-byte reparse points) must still resolve, if present.
+        let apps = std::env::var_os("LOCALAPPDATA")
+            .map(|l| PathBuf::from(l).join(r"Microsoft\WindowsApps"))
+            .filter(|d| d.is_dir());
+        let alias = apps.as_ref().and_then(|d| {
+            std::fs::read_dir(d)
+                .ok()?
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| {
+                    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+                        && std::fs::symlink_metadata(p).is_ok_and(|m| m.len() == 0)
+                })
+        });
+        if let (Some(dir), Some(alias)) = (apps, alias) {
+            let name = alias.file_stem().unwrap().to_owned();
+            assert!(
+                find_executable(&name, dir.as_os_str(), None).is_ok(),
+                "exec alias {alias:?} should resolve"
+            );
+        }
     }
 
     #[test]

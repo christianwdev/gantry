@@ -58,9 +58,10 @@ fn specta_builder() -> Builder<tauri::Wry> {
         .dangerously_cast_bigints_to_number()
 }
 
-/// Writes the bindings only when their content changed. An unconditional write on every dev
-/// launch makes Vite reload the page right after startup (re-running every probe) and lets a
-/// stale debug binary silently overwrite the checked-in file.
+/// Writes the bindings only when their content changed: an unconditional write on every dev
+/// launch makes Vite reload the page right after startup (re-running every probe). Note this
+/// does not stop a *stale* debug binary from writing its older command surface; the
+/// `bindings_export` test + CI diff check is the source of truth for the committed file.
 #[cfg(debug_assertions)]
 fn export_bindings_if_changed(builder: &Builder<tauri::Wry>) -> Result<(), String> {
     let tmp = std::env::temp_dir().join(format!("gantry-bindings-{}.ts", std::process::id()));

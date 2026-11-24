@@ -29,10 +29,18 @@ pub enum Line {
 }
 
 /// Bounded line reader. Not cancel-safe: drive it from one dedicated reader task.
+///
+/// A read error mid-line keeps the partial line: the next call continues it, so a transient
+/// error never silently drops the head of a line or returns its tail as a separate line.
 #[derive(Debug)]
 pub struct LineReader<R> {
     inner: R,
+    /// Bytes of the line in progress (empty once the line went oversized).
     buf: Vec<u8>,
+    /// Raw bytes of the line in progress consumed so far.
+    total: usize,
+    /// The line in progress exceeded `max` and is being skipped to its newline.
+    oversized: bool,
     max: usize,
 }
 
@@ -48,19 +56,19 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
         LineReader {
             inner,
             buf: Vec::new(),
+            total: 0,
+            oversized: false,
             max: max_line,
         }
     }
 
     /// Reads the next line; `Ok(None)` at EOF. A final unterminated line is still returned.
     pub async fn next_line(&mut self) -> std::io::Result<Option<Line>> {
-        self.buf.clear();
-        let mut total = 0usize;
-        let mut oversized = false;
         loop {
+            // On error, `?` returns with the partial line kept in `self` for the next call.
             let available = self.inner.fill_buf().await?;
             if available.is_empty() {
-                if total == 0 {
+                if self.total == 0 {
                     return Ok(None);
                 }
                 break;
@@ -69,10 +77,10 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
                 Some(i) => (i + 1, true),
                 None => (available.len(), false),
             };
-            total += take;
-            if !oversized {
+            self.total += take;
+            if !self.oversized {
                 if self.buf.len() + take > self.max.saturating_add(2) {
-                    oversized = true;
+                    self.oversized = true;
                     self.buf = Vec::new();
                 } else {
                     self.buf.extend_from_slice(&available[..take]);
@@ -83,21 +91,22 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
                 break;
             }
         }
-        if oversized {
+        let total = std::mem::take(&mut self.total);
+        if std::mem::take(&mut self.oversized) {
             return Ok(Some(Line::Oversized { len: total }));
         }
+        let mut bytes = std::mem::take(&mut self.buf);
         // Strip "\n" or "\r\n" only; a lone trailing '\r' on an unterminated final line is
         // content, not a terminator.
-        if self.buf.last() == Some(&b'\n') {
-            self.buf.pop();
-            if self.buf.last() == Some(&b'\r') {
-                self.buf.pop();
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
             }
         }
-        if self.buf.len() > self.max {
+        if bytes.len() > self.max {
             return Ok(Some(Line::Oversized { len: total }));
         }
-        let bytes = std::mem::take(&mut self.buf);
         let text = String::from_utf8(bytes)
             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         Ok(Some(Line::Text(text)))
@@ -233,6 +242,42 @@ mod tests {
                 _ => Ok(()),
             })
         }
+    }
+
+    /// Plays back chunks; `None` is a transient read error.
+    struct Scripted(std::collections::VecDeque<Option<&'static [u8]>>);
+
+    impl AsyncRead for Scripted {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(match self.0.pop_front() {
+                Some(Some(chunk)) => {
+                    buf.put_slice(chunk);
+                    Ok(())
+                }
+                Some(None) => Err(std::io::Error::other("transient")),
+                None => Ok(()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn error_mid_line_keeps_the_partial_line() {
+        let script = [Some(&b"abc"[..]), None, Some(&b"def\nnext\n"[..])];
+        let mut r = LineReader::new(Scripted(script.into_iter().collect()), 1024);
+        assert!(r.next_line().await.is_err());
+        assert_eq!(
+            r.next_line().await.unwrap(),
+            Some(Line::Text("abcdef".into()))
+        );
+        assert_eq!(
+            r.next_line().await.unwrap(),
+            Some(Line::Text("next".into()))
+        );
+        assert_eq!(r.next_line().await.unwrap(), None);
     }
 
     #[tokio::test]
