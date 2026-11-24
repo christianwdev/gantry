@@ -61,6 +61,8 @@ fn main() {
                 writeln!(out, "{frame}").unwrap();
                 out.flush().unwrap();
             }
+            // Hand-written fixtures only: simulate the process dying at this point.
+            Some("exit") => std::process::exit(record["code"].as_i64().unwrap_or(1) as i32),
             _ => {}
         }
     }

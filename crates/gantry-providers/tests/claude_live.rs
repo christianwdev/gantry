@@ -26,4 +26,5 @@ live!(
     plan_mode,
     live_config,
     resume_fork_cross_cwd,
+    deny_and_stop,
 );

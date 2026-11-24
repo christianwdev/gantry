@@ -25,4 +25,6 @@ replay!(
     live_config,
     resume_fork_cross_cwd,
     unsupported_control_request,
+    exit_during_control,
+    deny_and_stop,
 );

@@ -16,15 +16,15 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use super::config::{ClaudeConfig, MCP_TOKEN_ENV, PermissionMode, RuntimeFiles};
-use super::normalize::Normalizer;
+use super::normalize::{ASK_USER_QUESTION, Normalizer};
 use super::wire;
 use crate::ApprovalDecision;
 use crate::event::{ProviderEvent, Resolution, TurnId};
 
 /// How long Gantry waits for Claude to answer one of its control requests.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Shutdown ladder: protocol cancel → EOF after this → kill after `SHUTDOWN_KILL_AFTER`.
-const SHUTDOWN_EOF_AFTER: Duration = Duration::from_secs(3);
+/// Shutdown: interrupt a running turn, close stdin (EOF is the stream-json stop), then kill the
+/// tree if the worker has not exited after this long.
 const SHUTDOWN_KILL_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +39,8 @@ pub enum SessionError {
     UnknownInteraction(String),
     #[error("interaction `{0}` is not a question")]
     NotAQuestion(String),
+    #[error("interaction `{0}` is a question: answer it with answer_questions")]
+    IsAQuestion(String),
     #[error("claude rejected `{request}`: {message}")]
     Rejected {
         request: &'static str,
@@ -236,7 +238,16 @@ impl ClaudeSession {
             let frame = wire::user_message(content, &state.native_session_id);
             (turn_id, frame)
         };
-        self.write(&frame).await?;
+        if let Err(e) = self.write(&frame).await {
+            // Claude never received it: don't leave a phantom turn open.
+            let events = self
+                .shared
+                .lock()
+                .normalizer
+                .abort_turn(&turn_id, "the prompt could not be delivered to claude");
+            self.shared.emit(events);
+            return Err(e);
+        }
         Ok(turn_id)
     }
 
@@ -249,7 +260,12 @@ impl ClaudeSession {
             }
             state.normalizer.note_interrupt_requested();
         }
-        self.control("interrupt", wire::interrupt()).await.map(drop)
+        let result = self.control("interrupt", wire::interrupt()).await.map(drop);
+        if result.is_err() {
+            // It never took effect; don't label the turn's eventual end as an interrupt.
+            self.shared.lock().normalizer.clear_interrupt_requested();
+        }
+        result
     }
 
     /// Answers a tool / plan approval.
@@ -265,6 +281,17 @@ impl ClaudeSession {
             .pending(interaction_id)
             .cloned()
             .ok_or_else(|| SessionError::UnknownInteraction(interaction_id.to_owned()))?;
+        if pending.tool_name == ASK_USER_QUESTION {
+            // An "allow" without answers would run the question tool with nothing chosen.
+            return Err(SessionError::IsAQuestion(interaction_id.to_owned()));
+        }
+        let stops_turn = matches!(
+            decision,
+            ApprovalDecision::Deny {
+                interrupt: true,
+                ..
+            }
+        );
         let (frame, resolution) = match decision {
             ApprovalDecision::Allow {
                 updated_input,
@@ -282,6 +309,11 @@ impl ClaudeSession {
                 Resolution::Denied,
             ),
         };
+        if stops_turn {
+            // "Deny and stop" ends the turn with an error result: that's an interrupt the
+            // user asked for, not an agent failure.
+            self.shared.lock().normalizer.note_interrupt_requested();
+        }
         self.write(&frame).await?;
         let events = self
             .shared
@@ -306,7 +338,7 @@ impl ClaudeSession {
             .pending(interaction_id)
             .cloned()
             .ok_or_else(|| SessionError::UnknownInteraction(interaction_id.to_owned()))?;
-        if pending.tool_name != "AskUserQuestion" {
+        if pending.tool_name != ASK_USER_QUESTION {
             return Err(SessionError::NotAQuestion(interaction_id.to_owned()));
         }
         let mut input = pending.input;
@@ -314,9 +346,13 @@ impl ClaudeSession {
             .into_iter()
             .map(|(q, a)| (q, Value::String(a)))
             .collect();
-        if let Some(obj) = input.as_object_mut() {
-            obj.insert("answers".into(), Value::Object(answers));
-        }
+        let Some(obj) = input.as_object_mut() else {
+            // Never send an "allow" that silently drops the user's answers.
+            return Err(SessionError::Io(std::io::Error::other(
+                "AskUserQuestion input is not a JSON object",
+            )));
+        };
+        obj.insert("answers".into(), Value::Object(answers));
         self.write(&wire::allow(interaction_id, input, &[])).await?;
         let events = self
             .shared
@@ -419,7 +455,7 @@ impl ClaudeSession {
 /// The actor: frames stdout, routes control traffic, feeds the normalizer, and owns the
 /// process for shutdown.
 async fn run(
-    mut child: ManagedChild,
+    child: ManagedChild,
     stdout: gantry_proc::ChildStdout,
     shared: Arc<Shared>,
     writer: StdinWriter,
@@ -435,7 +471,10 @@ async fn run(
         }
     });
 
-    let mut shutdown_reply = None;
+    let mut child = Some(child);
+    let mut ladder_reply: Option<oneshot::Sender<gantry_proc::Result<Shutdown>>> = None;
+    let (ladder_tx, mut ladder_rx) =
+        mpsc::channel::<(ManagedChild, gantry_proc::Result<Shutdown>)>(1);
     let mut commands_open = true;
     loop {
         tokio::select! {
@@ -447,35 +486,58 @@ async fn run(
                 }]),
                 None => break, // EOF: the process is gone (or closed stdout)
             },
-            command = commands.recv(), if commands_open => match command {
-                Some(Command::Shutdown { reply }) => {
-                    let outcome = child.shutdown(SHUTDOWN_EOF_AFTER, SHUTDOWN_KILL_AFTER).await;
-                    let _ = reply.send(outcome);
-                    // Keep draining stdout to EOF so the final frames are still delivered.
-                }
-                None => {
+            command = commands.recv(), if commands_open && child.is_some() => {
+                match command {
+                    Some(Command::Shutdown { reply }) => ladder_reply = Some(reply),
                     // Every handle dropped: nobody can talk to this worker anymore.
-                    commands_open = false;
-                    shutdown_reply = Some(child.shutdown(SHUTDOWN_EOF_AFTER, SHUTDOWN_KILL_AFTER).await);
+                    None => commands_open = false,
                 }
-            },
+                // The ladder runs in its own task so this loop keeps draining stdout (Claude may
+                // still flush final frames; a full pipe must not stall its exit).
+                let mut c = child.take().expect("guarded by child.is_some()");
+                let done = ladder_tx.clone();
+                tokio::spawn(async move {
+                    // For a stream-json worker EOF *is* the protocol-level stop: close stdin
+                    // first instead of waiting for an exit that won't come on its own.
+                    c.close_stdin();
+                    let outcome = c.shutdown(Duration::ZERO, SHUTDOWN_KILL_AFTER).await;
+                    let _ = done.send((c, outcome)).await;
+                });
+            }
+            Some((c, outcome)) = ladder_rx.recv() => {
+                child = Some(c);
+                if let Some(reply) = ladder_reply.take() {
+                    let _ = reply.send(outcome);
+                }
+            }
         }
     }
 
+    // A ladder may still be running: get the process back from it before the final wait.
+    let mut child = match child {
+        Some(c) => c,
+        None => match ladder_rx.recv().await {
+            Some((c, outcome)) => {
+                if let Some(reply) = ladder_reply.take() {
+                    let _ = reply.send(outcome);
+                }
+                c
+            }
+            None => unreachable!("this task holds a ladder sender"),
+        },
+    };
     let exit_code = match child.wait_timeout(Duration::from_secs(5)).await {
         Ok(Some(status)) => Some(status.code()),
         _ => None,
     };
-    drop(shutdown_reply);
     let (events, pending) = {
         let mut state = shared.lock();
         state.exited = true;
         let events = state.normalizer.process_exited(exit_code);
         (events, std::mem::take(&mut state.pending_controls))
     };
-    for (_, reply) in pending {
-        let _ = reply.send(Err("the claude process exited".into()));
-    }
+    // Dropping the senders makes waiting control requests fail with `SessionError::Exited`.
+    drop(pending);
     shared.emit(events);
 }
 

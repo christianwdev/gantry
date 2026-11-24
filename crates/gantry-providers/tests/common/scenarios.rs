@@ -1,16 +1,27 @@
 //! The X2 pass criteria (docs/ROADMAP.md) as scenarios that run live or as replays.
 
 use gantry_providers::ApprovalDecision;
-use gantry_providers::claude::{ClaudeSession, PermissionMode, Resume};
+use gantry_providers::claude::{ClaudeSession, PermissionMode, Resume, SessionError};
 use gantry_providers::event::{ApprovalKind, ProviderEvent, Resolution, TurnStatus};
 
 use super::{Events, Harness, Mode};
 
 async fn shutdown(session: ClaudeSession, events: &mut Events) {
+    let t = std::time::Instant::now();
     let outcome = session.shutdown().await.expect("shutdown");
     assert!(
         outcome.tree_empty,
         "claude's process tree must be gone after shutdown"
+    );
+    assert!(
+        !outcome.forced,
+        "an idle worker exits on stdin EOF without being killed"
+    );
+    // EOF is the stream-json stop: no waiting for an exit that won't come on its own.
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(3),
+        "shutdown took {:?}",
+        t.elapsed()
     );
     events.terminated().await;
 }
@@ -139,6 +150,19 @@ pub async fn ask_question(h: &Harness) {
         .find(|o| o.label.to_lowercase().contains("blue"))
         .map(|o| o.label.clone())
         .unwrap_or_else(|| "Blue".into());
+    // A question card can't be "approved" without answers.
+    assert!(matches!(
+        session
+            .respond_approval(
+                &id,
+                ApprovalDecision::Allow {
+                    updated_input: None,
+                    remember: vec![]
+                }
+            )
+            .await,
+        Err(SessionError::IsAQuestion(_))
+    ));
     session
         .answer_questions(&id, [(question.id.clone(), blue)])
         .await
@@ -356,6 +380,47 @@ pub async fn unsupported_control_request(h: &Harness) {
         1
     );
     shutdown(session, &mut events).await;
+}
+
+/// Replay-only (hand-written fixture): the process dies while a control request is pending.
+/// The caller must see `Exited` (not a "rejected" request), and the session terminates.
+pub async fn exit_during_control(h: &Harness) {
+    let cwd = h.workdir("a");
+    let (session, mut events) = h.spawn("main", &cwd).await;
+    let err = session.set_model("sonnet").await.unwrap_err();
+    assert!(matches!(err, SessionError::Exited), "{err:?}");
+    events.terminated().await;
+    assert!(matches!(
+        session.send_prompt("hi").await,
+        Err(SessionError::Exited)
+    ));
+}
+
+/// "Deny and stop": the turn ends as an interrupt the user asked for, not a failure.
+pub async fn deny_and_stop(h: &Harness) {
+    let cwd = h.workdir("a");
+    let (session, mut events) = h.spawn("main", &cwd).await;
+    session
+        .send_prompt(
+            "Run the shell command `ping -n 3 127.0.0.1` using your Bash tool and summarize it.",
+        )
+        .await
+        .unwrap();
+    let id = approval(&mut events, "Bash").await;
+    session
+        .respond_approval(
+            &id,
+            ApprovalDecision::Deny {
+                message: "Stopped from Gantry".into(),
+                interrupt: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.turn_completed().await.0, TurnStatus::Interrupted);
+    assert!(resolved(&events, &id, Resolution::Denied));
+    shutdown(session, &mut events).await;
+    h.save_fixtures(&["main"]);
 }
 
 async fn approval(events: &mut Events, tool: &str) -> String {
