@@ -549,6 +549,32 @@ async fn child_outlives_callers_group_handle() {
     );
 }
 
+/// Review fix: frames `send` already accepted are delivered before EOF, even when stdin is
+/// closed immediately afterwards (e.g. a final protocol message, then shutdown).
+#[tokio::test(flavor = "multi_thread")]
+async fn close_stdin_flushes_frames_already_accepted() {
+    let mut child = ManagedCommand::new(FIXTURE)
+        .arg("echo")
+        .stdin(Stdio::Piped)
+        .stdout(Stdio::Piped)
+        .spawn()
+        .unwrap();
+    let writer = child.stdin_writer(256).unwrap();
+    const N: usize = 200;
+    for i in 0..N {
+        writer.send_line(&format!("frame-{i}")).await.unwrap();
+    }
+    child.close_stdin(); // right away: frames are still queued in the writer task
+    let mut out = LineReader::new(child.stdout.take().unwrap(), DEFAULT_MAX_LINE);
+    let mut got = 0;
+    while let Some(line) = out.next_line().await.unwrap() {
+        assert_eq!(line, Line::Text(format!("echo:frame-{got}")));
+        got += 1;
+    }
+    assert_eq!(got, N, "frames accepted by send() were dropped on close");
+    assert!(child.wait().await.unwrap().success());
+}
+
 /// Review fix: a send issued right after close_stdin() must fail, not be silently dropped.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_after_close_stdin_fails_immediately() {

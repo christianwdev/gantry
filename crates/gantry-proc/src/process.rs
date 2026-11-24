@@ -31,6 +31,12 @@ use crate::{Error, Job, Result};
 /// How long `shutdown` waits for a terminated job to report zero processes.
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long closing stdin may spend delivering frames already accepted by `StdinWriter::send`.
+const STDIN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the ladder waits for a terminated process to actually report exit.
+const TERMINATE_WAIT: Duration = Duration::from_secs(10);
+
 /// How a child's stdio stream is connected.
 ///
 /// There is deliberately no `Inherit`: Gantry is a GUI process with no console to share, and
@@ -500,23 +506,47 @@ impl ManagedChild {
         let closed = Arc::new(AtomicBool::new(false));
         self.stdin_close = Some((close_tx, Arc::clone(&closed)));
         tokio::spawn(async move {
+            // Once a close is requested: accept no new frames, but still deliver every frame a
+            // `send` already returned Ok for (often the final protocol message), as long as the
+            // child keeps reading. A full pipe (child not reading) can't block the close past
+            // the flush deadline.
+            let mut flush_deadline: Option<tokio::time::Instant> = None;
             loop {
-                let frame = tokio::select! {
-                    biased;
-                    _ = &mut close_rx => break,
-                    frame = rx.recv() => match frame {
-                        Some(frame) => frame,
-                        None => break,
+                let frame = match flush_deadline {
+                    Some(_) => match rx.try_recv() {
+                        Ok(frame) => frame,
+                        Err(_) => break, // queue drained
+                    },
+                    None => tokio::select! {
+                        biased;
+                        _ = &mut close_rx => {
+                            rx.close();
+                            flush_deadline = Some(tokio::time::Instant::now() + STDIN_FLUSH_TIMEOUT);
+                            continue;
+                        }
+                        frame = rx.recv() => match frame {
+                            Some(frame) => frame,
+                            None => break, // every StdinWriter dropped
+                        },
                     },
                 };
-                // A full pipe (child not reading) must not block a close request.
-                let wrote = tokio::select! {
-                    biased;
-                    _ = &mut close_rx => break,
-                    res = pipe.write_all(&frame) => res.is_ok(),
+                let mut write = std::pin::pin!(pipe.write_all(&frame));
+                let wrote = match flush_deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, &mut write).await,
+                    None => tokio::select! {
+                        biased;
+                        res = &mut write => Ok(res),
+                        // Close requested mid-write: finish this frame within the deadline.
+                        _ = &mut close_rx => {
+                            rx.close();
+                            let deadline = tokio::time::Instant::now() + STDIN_FLUSH_TIMEOUT;
+                            flush_deadline = Some(deadline);
+                            tokio::time::timeout_at(deadline, &mut write).await
+                        }
+                    },
                 };
-                if !wrote {
-                    break;
+                if !matches!(wrote, Ok(Ok(()))) {
+                    break; // pipe broken, or the flush deadline passed
                 }
             }
             // Dropping `pipe` here closes the server end: the child reads EOF.
@@ -689,7 +719,12 @@ impl ManagedChild {
             tracing::error!(pid = self.pid, error = %tree_err, "TerminateJobObject failed");
             self.kill().map_err(|_| tree_err)?;
         }
-        self.wait().await
+        // Bounded: a process stuck in uncancellable kernel I/O (AV/filter driver, hung network
+        // redirector) can stay unsignaled after termination; don't hang teardown forever.
+        match self.wait_timeout(TERMINATE_WAIT).await? {
+            Some(status) => Ok(status),
+            None => Err(Error::NotTerminated { pid: self.pid }),
+        }
     }
 }
 

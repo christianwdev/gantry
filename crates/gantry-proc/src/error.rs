@@ -8,7 +8,7 @@ pub enum Error {
     #[error("executable `{}` not found", program.display())]
     NotFound { program: OsString },
 
-    /// Only a script shim (`.cmd`, `.bat`, `.ps1`) was found. Gantry never launches through
+    /// Only a script shim (`.cmd`, `.bat`, `.ps1`, `.vbs`) was found. Gantry never launches through
     /// `cmd.exe`; callers must point at the real `.exe` (or at `node.exe` + the script).
     #[error("`{}` only resolves to a script shim ({}); a real .exe is required", program.display(), shim.display())]
     ShimOnly { program: OsString, shim: PathBuf },
@@ -24,7 +24,7 @@ pub enum Error {
     /// A relative program path was given without `current_dir`; it would otherwise resolve
     /// against Gantry's own arbitrary working directory.
     #[error(
-        "relative program path `{}` needs current_dir (or use an absolute path)",
+        "relative program path `{}` needs an absolute current_dir (or use an absolute path)",
         path.display()
     )]
     RelativeWithoutCwd { path: PathBuf },
@@ -40,6 +40,11 @@ pub enum Error {
     /// An environment variable name was empty or contained `=` (after its first character).
     #[error("invalid environment variable name `{}`", name.display())]
     InvalidEnvName { name: OsString },
+
+    /// A process was terminated but did not report exit in time (typically stuck in
+    /// uncancellable kernel I/O). It may still hold files open.
+    #[error("process {pid} did not exit after being terminated")]
+    NotTerminated { pid: u32 },
 
     /// A Win32 call failed.
     #[error("{op} failed: {source}")]

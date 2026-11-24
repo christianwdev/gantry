@@ -46,7 +46,7 @@ export type ToolState =
 /**  Not found on the (merged process + registry) `PATH`. */
 "missing" | 
 /**
- *  Only a `.cmd`/`.bat`/`.ps1` shim exists (e.g. an npm global install); Gantry needs the
+ *  Only a `.cmd`/`.bat`/`.ps1`/`.vbs` shim exists (e.g. an npm global install); Gantry needs the
  *  real executable.
  */
 "shimOnly" | 

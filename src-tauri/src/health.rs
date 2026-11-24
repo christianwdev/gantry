@@ -39,7 +39,7 @@ pub enum ToolState {
     Ok,
     /// Not found on the (merged process + registry) `PATH`.
     Missing,
-    /// Only a `.cmd`/`.bat`/`.ps1` shim exists (e.g. an npm global install); Gantry needs the
+    /// Only a `.cmd`/`.bat`/`.ps1`/`.vbs` shim exists (e.g. an npm global install); Gantry needs the
     /// real executable.
     ShimOnly,
     /// Found, but `--version` failed, timed out or printed nothing.
@@ -119,8 +119,16 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         // Drain both streams concurrently (so a full pipe can't stall the child), but finish on
         // the process exiting, not on EOF: a helper that inherited a stream would hold it open.
         let readers = [
-            capture(child.stdout.take(), Arc::clone(&sinks.stdout)),
-            capture(child.stderr.take(), Arc::clone(&sinks.stderr)),
+            capture(
+                child.stdout.take(),
+                Arc::clone(&sinks.stdout),
+                Arc::clone(&sinks.finished),
+            ),
+            capture(
+                child.stderr.take(),
+                Arc::clone(&sinks.stderr),
+                Arc::clone(&sinks.finished),
+            ),
         ];
         let exit = child.wait().await?;
         *lock(&exited_slot) = Some(exit);
@@ -183,6 +191,17 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         // Dropping the child (and its job) inside `run` killed the probe's process tree.
         Err(_) => {
             status.path = lock(&launched).take();
+            if status.path.is_some() {
+                // Dropping `run` killed the tree, so the pipes are closing; let the capture tasks
+                // drain the last bytes (bounded) before classifying, or a version printed just
+                // before the deadline could be missed.
+                let deadline = Instant::now() + KILL_GRACE;
+                while captured.finished.load(std::sync::atomic::Ordering::Acquire) < 2
+                    && Instant::now() < deadline
+                {
+                    tokio::time::sleep(POLL).await;
+                }
+            }
             let exit = *lock(&exited);
             let secs = PROBE_TIMEOUT.as_secs();
             // Whether the probed process itself exited (only a leftover held a stream open).
@@ -226,6 +245,9 @@ const MAX_CAPTURE: usize = 64 * 1024;
 struct Captured {
     stdout: Arc<Mutex<Vec<u8>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    /// How many capture tasks have finished (reached EOF): lets the timeout path wait for the
+    /// last bytes before classifying, since those tasks outlive the timed-out future.
+    finished: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Captured {
@@ -247,11 +269,23 @@ impl Captured {
 }
 
 /// Drains `stream` into `sink` (keeping at most [`MAX_CAPTURE`] bytes) until EOF.
-fn capture<R>(stream: Option<R>, sink: Arc<Mutex<Vec<u8>>>) -> tokio::task::JoinHandle<()>
+fn capture<R>(
+    stream: Option<R>,
+    sink: Arc<Mutex<Vec<u8>>>,
+    finished: Arc<std::sync::atomic::AtomicUsize>,
+) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    /// Counts the task as finished however it ends.
+    struct Done(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
     tokio::spawn(async move {
+        let _done = Done(finished);
         let Some(mut stream) = stream else {
             return;
         };
@@ -281,18 +315,38 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Lines starting with these (case-insensitive) are diagnostics, not the version, even if
 /// they contain a version number (`Warning: Node.js v18.0.0 is deprecated`).
+/// Matched as whole words (see [`is_diagnostic`]), so `updater 1.4.0` is still a version.
 const DIAGNOSTIC_PREFIXES: &[&str] = &[
-    "warning", "warn", "error", "err!", "deprecat", "note", "notice", "info", "debug", "update",
+    "warning",
+    "warn",
+    "error",
+    "err!",
+    "deprecated",
+    "deprecation",
+    "note",
+    "notice",
+    "info",
+    "debug",
+    "update",
     "(node:",
 ];
+
+/// Whether `line` starts with a diagnostic word (`Warning:`, `[warn]`, `npm ERR!`-style
+/// `ERR!`, `(node:1234) ...`), followed by a word boundary.
+fn is_diagnostic(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let lower = lower.trim_start_matches('[');
+    DIAGNOSTIC_PREFIXES.iter().any(|p| {
+        lower.strip_prefix(p).is_some_and(|rest| {
+            p.ends_with([':', '!'])
+                || !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+    })
+}
 
 /// The first line that [`looks_like_version`] and isn't a diagnostic, trimmed.
 fn version_line(bytes: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(bytes);
-    let is_diagnostic = |l: &str| {
-        let lower = l.to_ascii_lowercase();
-        DIAGNOSTIC_PREFIXES.iter().any(|p| lower.starts_with(p))
-    };
     text.lines()
         .map(str::trim)
         .find(|l| looks_like_version(l) && !is_diagnostic(l))
@@ -368,6 +422,28 @@ mod tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("config file is corrupt"))
         );
+    }
+
+    #[test]
+    fn diagnostic_prefixes_match_whole_words_only() {
+        for d in [
+            "Warning: Node.js v18.0.0 is deprecated",
+            "[warn] 1.2.3 is old",
+            "ERR! code 1.0.0",
+            "Deprecated: v1.2",
+            "(node:1234) ExperimentalWarning 1.2",
+            "update available: 2.2.0",
+        ] {
+            assert!(super::is_diagnostic(d), "{d}");
+        }
+        for v in [
+            "updater 1.4.0",
+            "info-cli 2.0.1",
+            "notes-tool 3.1",
+            "codex-cli 0.171.0",
+        ] {
+            assert!(!super::is_diagnostic(v), "{v}");
+        }
     }
 
     #[test]
