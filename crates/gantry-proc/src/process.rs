@@ -4,6 +4,7 @@ use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle, Ra
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -415,7 +416,7 @@ pub struct ManagedChild {
     process: OwnedHandle,
     job: Arc<Job>,
     status: Option<ExitStatus>,
-    stdin_close: Option<oneshot::Sender<()>>,
+    stdin_close: Option<(oneshot::Sender<()>, Arc<AtomicBool>)>,
     /// Raw stdin. Prefer [`ManagedChild::stdin_writer`]: if you `take()` this, the shutdown
     /// ladder can no longer close stdin for you.
     pub stdin: Option<ChildStdin>,
@@ -431,17 +432,21 @@ pub struct ManagedChild {
 #[derive(Debug, Clone)]
 pub struct StdinWriter {
     tx: mpsc::Sender<Vec<u8>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl StdinWriter {
     /// Queues bytes for the child, waiting while the queue is full.
     ///
-    /// Fails with `BrokenPipe` once stdin is closed or the child stopped reading.
+    /// Fails with `BrokenPipe` once stdin is closed or the child stopped reading. Any `send`
+    /// that starts after [`ManagedChild::close_stdin`] returned fails; a send racing the close
+    /// itself may be dropped, as with any pipe being closed concurrently.
     pub async fn send(&self, bytes: impl Into<Vec<u8>>) -> io::Result<()> {
-        self.tx
-            .send(bytes.into())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "child stdin is closed"))
+        let broken = || io::Error::new(io::ErrorKind::BrokenPipe, "child stdin is closed");
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Err(broken());
+        }
+        self.tx.send(bytes.into()).await.map_err(|_| broken())
     }
 
     /// Queues one NDJSON frame (`line` + `\n`).
@@ -477,7 +482,8 @@ impl ManagedChild {
         let mut pipe = self.stdin.take()?;
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(capacity.max(1));
         let (close_tx, mut close_rx) = oneshot::channel::<()>();
-        self.stdin_close = Some(close_tx);
+        let closed = Arc::new(AtomicBool::new(false));
+        self.stdin_close = Some((close_tx, Arc::clone(&closed)));
         tokio::spawn(async move {
             loop {
                 let frame = tokio::select! {
@@ -500,13 +506,16 @@ impl ManagedChild {
             }
             // Dropping `pipe` here closes the server end: the child reads EOF.
         });
-        Some(StdinWriter { tx })
+        Some(StdinWriter { tx, closed })
     }
 
     /// Closes stdin (EOF) whether it is still held here or owned by a [`StdinWriter`] task.
     pub fn close_stdin(&mut self) {
         self.stdin = None;
-        if let Some(close) = self.stdin_close.take() {
+        if let Some((close, closed)) = self.stdin_close.take() {
+            // Flag first, so every send starting after this call fails instead of queueing a
+            // frame the writer task will never deliver.
+            closed.store(true, AtomicOrdering::Release);
             let _ = close.send(());
         }
     }

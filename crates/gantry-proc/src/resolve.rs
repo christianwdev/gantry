@@ -155,10 +155,16 @@ fn registry_value(root: HKEY, subkey: &str, name: &OsStr) -> Option<Vec<u16>> {
 /// `ExpandEnvironmentStringsW` would use Gantry's process environment, which is exactly what
 /// is stale after an install: an installer that adds `NVM_SYMLINK` / `PNPM_HOME` and appends
 /// `%NVM_SYMLINK%` to PATH would otherwise leave a literal, unusable entry.
+///
+/// Scoping matches Windows: the machine `Path` is expanded with system variables only, the user
+/// `Path` with user variables first, then system ones.
 fn registry_path(root: HKEY, subkey: &str) -> Option<OsString> {
     let raw = registry_value(root, subkey, OsStr::new("Path"))?;
+    let is_user = root == HKEY_CURRENT_USER;
     let lookup = |name: &OsStr| {
-        registry_value(HKEY_CURRENT_USER, USER_ENV, name)
+        is_user
+            .then(|| registry_value(HKEY_CURRENT_USER, USER_ENV, name))
+            .flatten()
             .or_else(|| registry_value(HKEY_LOCAL_MACHINE, MACHINE_ENV, name))
             .or_else(|| std::env::var_os(name).map(|v| v.encode_wide().collect()))
     };
@@ -441,8 +447,8 @@ mod tests {
         assert_eq!(split_path_list(&merged).count(), 3);
     }
 
-    #[test]
-    fn junctions_to_directories_are_skipped_but_exec_aliases_resolve() {
+    #[tokio::test]
+    async fn junctions_to_directories_are_skipped_but_exec_aliases_resolve() {
         let root =
             std::env::temp_dir().join(format!("gantry-proc-junction-{}", std::process::id()));
         let (early, late, target) = (root.join("early"), root.join("late"), root.join("target"));
@@ -451,20 +457,20 @@ mod tests {
         }
         std::fs::copy(system32().join("cmd.exe"), late.join("tool.exe")).unwrap();
         // A junction (no privilege needed) named like the program, pointing at a directory.
-        let status = crate::ManagedCommand::new("cmd")
+        // Keep the child until it exits: dropping it would kill mklink via its job before the
+        // junction exists (which silently made an earlier version of this test vacuous).
+        let mut mklink = crate::ManagedCommand::new("cmd")
             .args(["/c", "mklink", "/J"])
             .arg(early.join("tool.exe"))
             .arg(&target)
             .spawn()
             .unwrap();
-        drop(status);
-        // Wait for mklink (sync, no runtime needed for Stdio::Null).
-        for _ in 0..100 {
-            if early.join("tool.exe").exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        assert!(mklink.wait().await.unwrap().success(), "mklink /J failed");
+        let junction = std::fs::symlink_metadata(early.join("tool.exe")).unwrap();
+        assert!(
+            junction.file_type().is_symlink(),
+            "precondition: a junction named tool.exe must exist"
+        );
         let mut search = early.clone().into_os_string();
         search.push(";");
         search.push(late.as_os_str());

@@ -522,6 +522,21 @@ async fn shutdown_closes_stdin_owned_by_writer_task() {
     assert!(writer.send_line("too late").await.is_err());
 }
 
+/// Review fix: a send issued right after close_stdin() must fail, not be silently dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_after_close_stdin_fails_immediately() {
+    let mut child = ManagedCommand::new(FIXTURE)
+        .arg("echo")
+        .stdin(Stdio::Piped)
+        .spawn()
+        .unwrap();
+    let writer = child.stdin_writer(64).unwrap();
+    child.close_stdin();
+    let err = writer.send_line("dropped?").await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    assert!(child.wait().await.unwrap().success());
+}
+
 /// Review fix: a clean exit at the EOF step must still reap helpers the agent started (e.g.
 /// an MCP server), even while someone else holds a clone of the child's job.
 #[tokio::test(flavor = "multi_thread")]

@@ -98,6 +98,9 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
     // PROBE_TIMEOUT covers everything, including resolution.
     let launched = Arc::new(Mutex::new(None::<String>));
     let launched_slot = Arc::clone(&launched);
+    // Lives outside `run`, so output collected before a timeout isn't lost with the future.
+    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let buf = Arc::clone(&output);
     let run = async move {
         // Resolution and CreateProcess do blocking registry/filesystem work (a PATH entry on an
         // unreachable network share can stall for tens of seconds), so keep them off the async
@@ -111,7 +114,6 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         // Drain stdout concurrently (so a full pipe can't stall the child) into a shared
         // buffer, but finish on the process exiting, not on EOF: a helper that inherited stdout
         // would hold it open.
-        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let sink = Arc::clone(&buf);
         let mut stdout = child.stdout.take();
         let mut reader = tokio::spawn(async move {
@@ -141,19 +143,19 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         // while (cold start, AV scan) to print. So keep waiting while nothing has been printed
         // (bounded by PROBE_TIMEOUT); once there is output, allow READ_GRACE for the rest, then
         // kill the tree, which closes any pipe a lingering helper holds -> EOF.
-        let exited_at = Instant::now();
+        // READ_GRACE is measured from when output first appeared (not from the exit), so a slow
+        // binary that starts printing late still gets the full grace to finish its line. A
+        // failed exit is already the answer, so its grace starts at the exit (otherwise we'd
+        // wait out PROBE_TIMEOUT and misreport "timed out" instead of the exit code).
+        let mut grace_from = (!exit.success()).then(Instant::now);
         loop {
             if tokio::time::timeout(POLL, &mut reader).await.is_ok() {
                 break;
             }
-            let has_output = buf
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .any(|b| !b.is_ascii_whitespace());
-            // A failed exit is already the answer: don't wait for output a full PROBE_TIMEOUT
-            // (which would misreport "timed out" instead of the exit code).
-            if (has_output || !exit.success()) && exited_at.elapsed() >= READ_GRACE {
+            if grace_from.is_none() && has_output(&buf) {
+                grace_from = Some(Instant::now());
+            }
+            if grace_from.is_some_and(|t| t.elapsed() >= READ_GRACE) {
                 let _ = child.kill_tree();
                 let _ = tokio::time::timeout(KILL_GRACE, &mut reader).await;
                 break;
@@ -192,10 +194,39 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         // Dropping the child (and its job) inside `run` killed the probe's process tree.
         Err(_) => {
             status.path = launched.lock().unwrap_or_else(|p| p.into_inner()).take();
-            status.error = Some(format!("`{program} --version` timed out"));
+            let printed = first_line(&output.lock().unwrap_or_else(|p| p.into_inner()));
+            match printed {
+                // It answered but then hung (e.g. a slow update check): usable, but say so.
+                Some(line) => {
+                    status.state = ToolState::Ok;
+                    status.version = Some(line);
+                    status.error = Some(format!(
+                        "`{program} --version` printed a version but did not exit within {}s",
+                        PROBE_TIMEOUT.as_secs()
+                    ));
+                }
+                None => status.error = Some(format!("`{program} --version` timed out")),
+            }
         }
     }
     status
+}
+
+/// Whether anything other than whitespace has been printed yet.
+fn has_output(buf: &Mutex<Vec<u8>>) -> bool {
+    buf.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|b| !b.is_ascii_whitespace())
+}
+
+/// The first non-empty line of `bytes` (lossy UTF-8), trimmed.
+fn first_line(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -208,6 +239,38 @@ mod tests {
 
     /// Review fix: a launcher stub that starts the real binary and exits immediately must not
     /// have the real binary killed before it prints the version.
+    /// Review fix: READ_GRACE starts when output first appears, so a late binary that writes
+    /// its version in pieces isn't killed mid-line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn late_output_written_in_pieces_is_not_truncated() {
+        let script = "require('child_process').spawn(process.execPath, ['-e', \
+            'setTimeout(() => process.stdout.write(\"claude \"), 2500); \
+             setTimeout(() => process.stdout.write(\"1.2.3\" + String.fromCharCode(10)), 2900)'], \
+            { stdio: ['ignore', 'inherit', 'ignore'], detached: true }).unref();";
+        let status = super::probe("Pieces", "node", &["-e", script]).await;
+        assert_eq!(
+            status.version.as_deref(),
+            Some("claude 1.2.3"),
+            "{status:?}"
+        );
+    }
+
+    /// Review fix: a CLI that prints its version and then hangs keeps its version.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn version_printed_before_a_hang_is_kept() {
+        let script = "console.log('v7.7.7'); setInterval(() => {}, 1000);";
+        let status = super::probe("Hangs", "node", &["-e", script]).await;
+        assert_eq!(status.state, super::ToolState::Ok, "{status:?}");
+        assert_eq!(status.version.as_deref(), Some("v7.7.7"));
+        assert!(
+            status
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("did not exit"))
+        );
+        assert!(status.path.is_some());
+    }
+
     /// Review fix: a slow real binary (cold start / AV scan) printing after READ_GRACE must
     /// still be reported, since nothing had been printed yet.
     #[tokio::test(flavor = "multi_thread")]

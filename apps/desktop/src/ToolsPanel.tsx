@@ -8,7 +8,7 @@ type ToolStatus = Awaited<ReturnType<typeof commands.toolHealth>>[number];
 const STATE_LABEL: Record<ToolStatus["state"], string> = {
   ok: "ok",
   missing: "not found",
-  shimOnly: "shim only (.cmd)",
+  shimOnly: "shim only (no .exe)",
   failed: "probe failed",
 };
 
