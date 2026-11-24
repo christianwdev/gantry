@@ -38,20 +38,23 @@ fn main() {
                 if input.read_line(&mut got).unwrap_or(0) == 0 {
                     return; // Gantry closed stdin: end of session
                 }
-                let actual: Value = serde_json::from_str(got.trim()).unwrap_or(Value::Null);
-                if actual["type"] != frame["type"] {
-                    eprintln!(
-                        "fake-claude: fixture line {}: expected `{}` frame, got `{}`",
-                        n + 1,
-                        frame["type"],
-                        actual["type"]
-                    );
-                    std::process::exit(3);
-                }
-                if let (Some(rec), Some(act)) =
-                    (frame["request_id"].as_str(), actual["request_id"].as_str())
+                let mut actual: Value = serde_json::from_str(got.trim()).unwrap_or(Value::Null);
+                // Gantry's own request ids are remapped, not compared; everything else Gantry
+                // writes must match the recording exactly (a wrong allow/deny, answer or
+                // request id would otherwise replay as if it were right).
+                if frame["type"] == "control_request"
+                    && let (Some(rec), Some(act)) =
+                        (frame["request_id"].as_str(), actual["request_id"].as_str())
                 {
                     ids.insert(rec.to_owned(), act.to_owned());
+                    actual["request_id"] = frame["request_id"].clone();
+                }
+                if actual != frame {
+                    fail(&format!(
+                        "fixture line {}: expected {frame}, got {}",
+                        n + 1,
+                        got.trim()
+                    ));
                 }
             }
             Some("out") if record.get("raw").is_some() => {
@@ -98,9 +101,23 @@ fn main() {
             _ => {}
         }
     }
-    // Like the real CLI: stay alive until Gantry closes stdin.
-    let mut sink = String::new();
-    while input.read_line(&mut sink).unwrap_or(0) > 0 {
-        sink.clear();
+    // Like the real CLI: stay alive until Gantry closes stdin. Anything Gantry sends now
+    // (a duplicate answer, an extra prompt) wasn't in the recording.
+    let mut extra = String::new();
+    while input.read_line(&mut extra).unwrap_or(0) > 0 {
+        if !extra.trim().is_empty() {
+            fail(&format!(
+                "unexpected input after the fixture ended: {}",
+                extra.trim()
+            ));
+        }
+        extra.clear();
     }
+}
+
+/// Reports a divergence from the recording. The harness fails any test whose session printed
+/// a `fake-claude:` line, so this can't go unnoticed even when the exit itself would.
+fn fail(message: &str) -> ! {
+    eprintln!("fake-claude: {message}");
+    std::process::exit(3);
 }

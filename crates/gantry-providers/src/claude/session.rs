@@ -14,7 +14,7 @@ use std::time::Duration;
 use gantry_proc::io::{DEFAULT_MAX_LINE, Line, LineReader, StderrTail};
 use gantry_proc::{ManagedChild, ManagedCommand, Shutdown, StdinWriter, Stdio};
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::config::{ClaudeConfig, MCP_TOKEN_ENV, PermissionMode, RuntimeFiles};
 use super::normalize::{ASK_USER_QUESTION, Normalizer, PendingInteraction};
@@ -60,6 +60,8 @@ pub enum SessionError {
     IncompleteAnswers(Vec<String>),
     #[error("the claude process has exited")]
     Exited,
+    #[error("the session is shutting down")]
+    ShuttingDown,
     #[error("claude failed to start: {cause}{}", stderr_suffix(stderr))]
     StartupFailed {
         cause: Box<SessionError>,
@@ -87,6 +89,8 @@ struct State {
     native_session_id: String,
     next_turn: u64,
     exited: bool,
+    /// Shutdown has begun: no new turns or config changes (only the shutdown's interrupt).
+    stopping: bool,
     /// The only sender of the event stream: dropped on termination so the stream ends.
     events: Option<mpsc::UnboundedSender<ProviderEvent>>,
     /// Control requests whose waiter gave up (timeout / dropped future), by kind: Claude may
@@ -109,6 +113,8 @@ struct Shared {
     state: Mutex<State>,
     raw_log: Option<Mutex<std::fs::File>>,
     next_request: AtomicU64,
+    /// Becomes `true` once the actor has finished (the session is terminated).
+    terminated: watch::Sender<bool>,
 }
 
 impl Shared {
@@ -142,7 +148,8 @@ impl Shared {
 }
 
 /// If a control request's waiter goes away (timeout / cancelled future) before Claude answered,
-/// moves the request to `late_controls` so a late answer is still interpreted.
+/// moves the request to `late_controls` so a late answer is still interpreted; if the answer
+/// had already arrived but was never read, reports it the same way.
 struct PendingControl<'a> {
     shared: &'a Shared,
     id: String,
@@ -150,13 +157,24 @@ struct PendingControl<'a> {
     /// Set once the request frame was handed to the writer. Only a request Claude actually
     /// received can be answered late; one that never left the queue is simply forgotten.
     sent: bool,
+    rx: oneshot::Receiver<ControlReply>,
 }
 
 impl Drop for PendingControl<'_> {
     fn drop(&mut self) {
         let mut state = self.shared.lock();
-        if state.pending_controls.remove(&self.id).is_some() && self.sent && !state.exited {
-            state.late_controls.insert(self.id.clone(), self.request);
+        let unanswered = state.pending_controls.remove(&self.id).is_some();
+        if state.exited {
+            return;
+        }
+        if unanswered {
+            if self.sent {
+                state.late_controls.insert(self.id.clone(), self.request);
+            }
+        } else if let Ok(reply) = self.rx.try_recv() {
+            // Delivered, but the waiter was cancelled before reading it.
+            let frame = reply_frame(&reply);
+            late_control_response(&mut state, self.request, reply, frame);
         }
     }
 }
@@ -276,11 +294,13 @@ impl ClaudeSession {
                 native_session_id: String::new(),
                 next_turn: 0,
                 exited: false,
+                stopping: false,
                 events: Some(events_tx),
                 late_controls: HashMap::new(),
             }),
             raw_log,
             next_request: AtomicU64::new(0),
+            terminated: watch::Sender::new(false),
         });
 
         let writer = child
@@ -373,6 +393,9 @@ impl ClaudeSession {
             let mut state = self.shared.lock();
             if state.exited {
                 return Err(SessionError::Exited);
+            }
+            if state.stopping {
+                return Err(SessionError::ShuttingDown);
             }
             if state.normalizer.active_turn().is_some() {
                 return Err(SessionError::TurnActive);
@@ -594,6 +617,9 @@ impl ClaudeSession {
     ///
     /// Idempotent: returns `Ok(None)` if the worker had already exited.
     pub async fn shutdown(&self) -> Result<Option<Shutdown>> {
+        // From here on no new turn or config change can start a request that would only be
+        // cut off (or killed) a moment later.
+        self.shared.lock().stopping = true;
         if self.active_turn().is_some() {
             // A turn cut short by shutdown is an interrupt the user asked for, even if the
             // process exits before Claude reports a result.
@@ -603,6 +629,8 @@ impl ClaudeSession {
             // because the user shut the session down.
             self.shared.lock().normalizer.note_interrupt_requested();
         }
+        // Subscribed before sending, so the actor finishing at any point is seen.
+        let mut terminated = self.shared.terminated.subscribe();
         let (reply, rx) = oneshot::channel();
         if self
             .commands
@@ -612,11 +640,17 @@ impl ClaudeSession {
         {
             return Ok(None);
         }
-        match rx.await {
-            Ok(Some(outcome)) => outcome.map(Some).map_err(SessionError::Shutdown),
-            // Already stopped by an earlier shutdown, or the actor ended (process gone)
-            // before running the ladder.
-            Ok(None) | Err(_) => Ok(None),
+        tokio::select! {
+            // A reply wins over termination: the ladder's outcome is the answer.
+            biased;
+            reply = rx => match reply {
+                Ok(Some(outcome)) => outcome.map(Some).map_err(SessionError::Shutdown),
+                // Already stopped by an earlier shutdown, or the actor ended (process gone)
+                // before running the ladder.
+                Ok(None) | Err(_) => Ok(None),
+            },
+            // The actor finished without reading the command.
+            _ = terminated.wait_for(|done| *done) => Ok(None),
         }
     }
 
@@ -631,6 +665,10 @@ impl ClaudeSession {
             if state.exited {
                 return Err(SessionError::Exited);
             }
+            // The shutdown's own interrupt still goes through.
+            if state.stopping && request != "interrupt" {
+                return Err(SessionError::ShuttingDown);
+            }
             state.pending_controls.insert(id.clone(), (tx, request));
         }
         // However this function ends (answered, timed out, dropped), the entry leaves
@@ -640,13 +678,14 @@ impl ClaudeSession {
             id: id.clone(),
             request,
             sent: false,
+            rx,
         };
         // The timeout covers the write too: a full stdin queue (Claude not reading) must not
         // hang a control request past its deadline.
         let exchange = async {
             self.write(&wire::control_request(&id, body)).await?;
             pending.sent = true;
-            match rx.await {
+            match (&mut pending.rx).await {
                 Ok(Ok(value)) => Ok(value),
                 Ok(Err(message)) => Err(SessionError::Rejected { request, message }),
                 // Sender dropped: the process exited before answering.
@@ -814,6 +853,13 @@ async fn run(
                         }
                     }
                 }
+                {
+                    // Also when every handle was simply dropped: a turn cut short by stopping
+                    // the worker is an interrupt, not a crash, and nothing new may start.
+                    let mut state = shared.lock();
+                    state.stopping = true;
+                    state.normalizer.note_interrupt_requested();
+                }
                 // The ladder runs in its own task so this loop keeps draining stdout (Claude may
                 // still flush final frames; a full pipe must not stall its exit).
                 let mut c = child.take().expect("guarded by child.is_some()");
@@ -841,6 +887,7 @@ async fn run(
         Some(c) => c,
         None => match ladder_rx.recv().await {
             Some((c, outcome)) => {
+                ladder_done = true;
                 if let Some(reply) = ladder_reply.take() {
                     let _ = reply.send(Some(outcome));
                 }
@@ -853,6 +900,21 @@ async fn run(
         Ok(Some(status)) => Some(status.code()),
         _ => None,
     };
+    // The process ended on its own (crash, exit): helpers it started may still be running in
+    // its job. Reap them before reporting termination, so "terminated" (and a later
+    // `shutdown() == Ok(None)`) means the tree is gone — e.g. before a worktree is removed.
+    if !ladder_done {
+        let _ = child.kill_tree();
+        if !matches!(
+            child.job().wait_until_empty(SHUTDOWN_KILL_AFTER).await,
+            Ok(true)
+        ) {
+            shared.lock().emit(vec![ProviderEvent::Other {
+                kind: "process_tree_not_empty".into(),
+                frame: Value::Null,
+            }]);
+        }
+    }
     // Let stderr drain to EOF (bounded) so a crash's last lines — usually the reason — are
     // delivered before the stream ends.
     if let Some(tail) = stderr_tail {
@@ -867,30 +929,57 @@ async fn run(
     // Dropping the senders makes waiting control requests fail with `SessionError::Exited`.
     state.pending_controls.clear();
     state.late_controls.clear();
+    drop(state);
+    // Wakes any shutdown() whose command was queued too late to be read (a closing mpsc
+    // channel does not reliably drop such a message, which would strand its reply sender).
+    shared.terminated.send_replace(true);
+}
+
+/// Claude's answer to one of Gantry's control requests.
+fn control_reply(response: &Value) -> ControlReply {
+    if response.get("subtype").and_then(Value::as_str) == Some("success") {
+        Ok(response.get("response").cloned().unwrap_or(Value::Null))
+    } else {
+        Err(response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error")
+            .to_owned())
+    }
+}
+
+/// A reply rendered back into its `control_response` shape (for `Other` events).
+fn reply_frame(reply: &ControlReply) -> Value {
+    match reply {
+        Ok(value) => json!({ "subtype": "success", "response": value }),
+        Err(message) => json!({ "subtype": "error", "error": message }),
+    }
 }
 
 /// A control response whose waiter already gave up: report what Claude applied anyway.
-fn late_control_response(state: &mut State, kind: &str, response: &Value, frame: &Value) {
-    let ok = response.get("subtype").and_then(Value::as_str) == Some("success");
-    let payload = response.get("response").unwrap_or(&Value::Null);
-    let field = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_owned);
-    let event = match kind {
-        // A success without the applied value can't be reported as a config change.
-        "set_model" if ok && field("model").is_some() => ProviderEvent::ConfigChanged {
-            model: field("model"),
+fn late_control_response(state: &mut State, kind: &str, reply: ControlReply, frame: Value) {
+    let field = |key: &str| match &reply {
+        Ok(payload) => payload.get(key).and_then(Value::as_str).map(str::to_owned),
+        Err(_) => None,
+    };
+    // A success without the applied value can't be reported as a config change.
+    let event = match (kind, field("model"), field("mode")) {
+        ("set_model", Some(model), _) => ProviderEvent::ConfigChanged {
+            model: Some(model),
             permission_mode: None,
         },
-        "set_permission_mode" if ok && field("mode").is_some() => ProviderEvent::ConfigChanged {
+        ("set_permission_mode", _, Some(mode)) => ProviderEvent::ConfigChanged {
             model: None,
-            permission_mode: field("mode"),
+            permission_mode: Some(mode),
         },
         _ => ProviderEvent::Other {
             kind: format!("late_control_response:{kind}"),
-            frame: frame.clone(),
+            frame,
         },
     };
     state.emit(vec![event]);
 }
+
 async fn handle_line(shared: &Shared, writer: &StdinWriter, text: &str) {
     let frame: Value = match serde_json::from_str(text) {
         Ok(frame) => frame,
@@ -916,24 +1005,19 @@ async fn handle_line(shared: &Shared, writer: &StdinWriter, text: &str) {
             let mut state = shared.lock();
             match state.pending_controls.remove(id) {
                 Some((reply, kind)) => {
-                    let result =
-                        if response.get("subtype").and_then(Value::as_str) == Some("success") {
-                            Ok(response.get("response").cloned().unwrap_or(Value::Null))
-                        } else {
-                            Err(response
-                                .get("error")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown error")
-                                .to_owned())
-                        };
                     // The waiter may have just given up (its guard hasn't run yet): then this
                     // is a late answer like any other.
-                    if reply.send(result).is_err() {
-                        late_control_response(&mut state, kind, response, &frame);
+                    if let Err(result) = reply.send(control_reply(response)) {
+                        late_control_response(&mut state, kind, result, frame.clone());
                     }
                 }
                 None => match state.late_controls.remove(id) {
-                    Some(kind) => late_control_response(&mut state, kind, response, &frame),
+                    Some(kind) => late_control_response(
+                        &mut state,
+                        kind,
+                        control_reply(response),
+                        frame.clone(),
+                    ),
                     None => state.emit(vec![ProviderEvent::Other {
                         kind: "unmatched_control_response".into(),
                         frame: frame.clone(),
@@ -993,11 +1077,13 @@ mod tests {
                 native_session_id: String::new(),
                 next_turn: 0,
                 exited: false,
+                stopping: false,
                 events: None,
                 late_controls: HashMap::new(),
             }),
             raw_log: Some(Mutex::new(std::fs::File::create(&path).unwrap())),
             next_request: AtomicU64::new(0),
+            terminated: watch::Sender::new(false),
         };
         shared.log_frame(
             "out",
@@ -1022,15 +1108,26 @@ mod tests {
             native_session_id: String::new(),
             next_turn: 0,
             exited: false,
+            stopping: false,
             events: Some(tx),
             late_controls: HashMap::new(),
         };
         let response = json!({"subtype":"success","request_id":"gantry-1","response":{}});
         let frame = json!({"type":"control_response","response":response});
-        late_control_response(&mut state, "set_model", &response, &frame);
+        late_control_response(
+            &mut state,
+            "set_model",
+            control_reply(&response),
+            frame.clone(),
+        );
         let with_value =
             json!({"subtype":"success","request_id":"gantry-2","response":{"mode":"plan"}});
-        late_control_response(&mut state, "set_permission_mode", &with_value, &frame);
+        late_control_response(
+            &mut state,
+            "set_permission_mode",
+            control_reply(&with_value),
+            frame,
+        );
         assert!(
             matches!(rx.try_recv(), Ok(ProviderEvent::Other { kind, .. }) if kind == "late_control_response:set_model")
         );

@@ -33,4 +33,5 @@ replay!(
     deny_and_stop,
     dismiss_question,
     startup_failure,
+    drop_busy_worker,
 );

@@ -32,6 +32,22 @@ async fn shutdown(session: ClaudeSession, events: &mut Events) {
     events.terminated().await;
 }
 
+/// Replay-only: dropping every session handle mid-turn (how a thread is closed) stops the
+/// worker; the cut-short turn is an interrupt the user asked for, not a crash.
+pub async fn drop_busy_worker(h: &Harness) {
+    let cwd = h.workdir("a");
+    let (session, mut events) = h.spawn("main", &cwd).await;
+    session.send_prompt("work").await.unwrap();
+    events
+        .until("ToolStarted", |e| {
+            matches!(e, ProviderEvent::ToolStarted { .. })
+        })
+        .await;
+    drop(session);
+    assert_eq!(events.turn_completed().await.0, TurnStatus::Interrupted);
+    events.terminated().await;
+}
+
 /// Replay-only: a worker that dies during the `initialize` handshake (not logged in, bad flag)
 /// fails `spawn` with its stderr attached, not a bare "exited".
 pub async fn startup_failure(h: &Harness) {

@@ -159,6 +159,17 @@ impl Scrubber {
                 "username `{name}` is too short to scrub from fixtures safely; record elsewhere"
             );
         }
+        // Paths can also come back in 8.3 short form (`C:\Users\ALEXAN~1\...`), which neither
+        // the full paths nor the full name match: scrub the short-name stem too.
+        let short_stem = |name: &str| -> String {
+            let stem: String = name
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '.')
+                .take(6)
+                .collect();
+            format!("{stem}~")
+        };
+        let stems: Vec<String> = [&account, &folder].iter().map(|n| short_stem(n)).collect();
         // Longest first, so "Alexandra" isn't half-replaced by "Alex".
         let mut names = vec![account, folder];
         names.sort_by_key(|n| std::cmp::Reverse(n.len()));
@@ -170,7 +181,15 @@ impl Scrubber {
             (home.clone(), "%HOME%".to_owned()),
             (escaped(&home), "%HOME%".to_owned()),
         ];
+        pairs.extend(stems.iter().map(|s| (s.clone(), "USER~".to_owned())));
         pairs.extend(names.iter().map(|n| (n.clone(), "user".to_owned())));
+        // The machine name (in hostnames, temp paths). Only when long enough to replace safely.
+        let host = std::env::var("COMPUTERNAME").unwrap_or_default();
+        if host.chars().count() >= 4 {
+            pairs.push((host.clone(), "host".to_owned()));
+            names.push(host);
+        }
+        names.extend(stems);
         Scrubber { pairs, names }
     }
 
@@ -250,9 +269,32 @@ fn strip_inventory(frame: &mut Value) {
         && frame["subtype"] == "init"
         && let Some(obj) = frame.as_object_mut()
     {
-        for key in ["tools", "slash_commands", "skills", "plugins", "agents"] {
+        for key in [
+            "tools",
+            "slash_commands",
+            "skills",
+            "plugins",
+            "agents",
+            "memory_paths",
+        ] {
             obj.remove(key);
         }
+    }
+    // result: the OAuth credential's expiry.
+    if frame["type"] == "result"
+        && let Some(obj) = frame.as_object_mut()
+    {
+        obj.remove("credential_expires_at");
+    }
+    // rate_limit_event: the account's plan usage and org overage settings. Only the shape
+    // matters to the adapter (it passes `rate_limit_info` through), so keep a neutral stub.
+    if frame["type"] == "rate_limit_event"
+        && let Some(obj) = frame.as_object_mut()
+    {
+        obj.insert(
+            "rate_limit_info".into(),
+            serde_json::json!({ "status": "allowed" }),
+        );
     }
 }
 
@@ -403,6 +445,73 @@ impl Events {
             Ok(Some(e)) => panic!("event after SessionTerminated: {e:?}"),
             Err(_) => panic!("event stream did not end after SessionTerminated"),
         }
+        self.check_invariants();
+    }
+
+    /// Whole-stream invariants, checked once the stream has ended.
+    fn check_invariants(&self) {
+        use std::collections::HashMap;
+        // fake-claude reports a divergence from its recording on stderr (and exits), which a
+        // scenario might otherwise not notice.
+        for e in &self.seen {
+            if let ProviderEvent::ProviderStderr { line } = e {
+                assert!(!line.starts_with("fake-claude:"), "{line}");
+            }
+        }
+        // Every turn that started completes exactly once; nothing completes that didn't start.
+        let mut turns: HashMap<&str, usize> = HashMap::new();
+        // Per interaction: still open after its last (re-)announcement?
+        let mut open: HashMap<&str, bool> = HashMap::new();
+        for e in &self.seen {
+            match e {
+                ProviderEvent::TurnStarted { turn_id, .. } => {
+                    assert!(
+                        turns.insert(turn_id, 0).is_none(),
+                        "turn {turn_id} started twice"
+                    );
+                }
+                ProviderEvent::TurnCompleted { turn_id, .. } => {
+                    let completions = turns
+                        .get_mut(turn_id.as_str())
+                        .unwrap_or_else(|| panic!("turn {turn_id} completed but never started"));
+                    *completions += 1;
+                }
+                ProviderEvent::ApprovalRequested { interaction_id, .. }
+                | ProviderEvent::QuestionsRequested { interaction_id, .. } => {
+                    open.insert(interaction_id, true);
+                }
+                ProviderEvent::InteractionResolved { interaction_id, .. } => {
+                    let was_open = open.insert(interaction_id, false);
+                    assert_eq!(
+                        was_open,
+                        Some(true),
+                        "interaction {interaction_id} resolved while not open"
+                    );
+                }
+                _ => {}
+            }
+        }
+        for (turn_id, completions) in turns {
+            assert_eq!(
+                completions, 1,
+                "turn {turn_id} completed {completions} times"
+            );
+        }
+        for (id, still_open) in open {
+            assert!(!still_open, "interaction {id} was never resolved");
+        }
+        let terminations = self.count(|e| matches!(e, ProviderEvent::SessionTerminated { .. }));
+        assert_eq!(
+            terminations, 1,
+            "SessionTerminated must appear exactly once"
+        );
+        assert!(
+            matches!(
+                self.seen.last(),
+                Some(ProviderEvent::SessionTerminated { .. })
+            ),
+            "SessionTerminated must be the last event"
+        );
     }
 
     pub fn count(&self, pred: impl Fn(&ProviderEvent) -> bool) -> usize {
