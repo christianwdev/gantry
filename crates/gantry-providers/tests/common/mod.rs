@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gantry_providers::claude::{ClaudeConfig, ClaudeSession};
-use gantry_providers::event::{ProviderEvent, TurnStatus};
+use gantry_providers::event::{ProviderEvent, Resolution, TurnStatus};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -462,31 +462,71 @@ impl Events {
         let mut turns: HashMap<&str, usize> = HashMap::new();
         // Per interaction: still open after its last (re-)announcement?
         let mut open: HashMap<&str, bool> = HashMap::new();
+        // One turn at a time, and every turn-scoped event belongs to the running turn.
+        let mut running: Option<&str> = None;
+        let in_turn = |running: Option<&str>, turn_id: &str, e: &ProviderEvent| {
+            assert_eq!(
+                running,
+                Some(turn_id),
+                "event outside its running turn: {e:?}"
+            );
+        };
         for e in &self.seen {
             match e {
                 ProviderEvent::TurnStarted { turn_id, .. } => {
                     assert!(
+                        running.is_none(),
+                        "turn {turn_id} started while {running:?} was running"
+                    );
+                    assert!(
                         turns.insert(turn_id, 0).is_none(),
                         "turn {turn_id} started twice"
                     );
+                    running = Some(turn_id);
                 }
                 ProviderEvent::TurnCompleted { turn_id, .. } => {
                     let completions = turns
                         .get_mut(turn_id.as_str())
                         .unwrap_or_else(|| panic!("turn {turn_id} completed but never started"));
                     *completions += 1;
+                    in_turn(running, turn_id, e);
+                    running = None;
                 }
-                ProviderEvent::ApprovalRequested { interaction_id, .. }
-                | ProviderEvent::QuestionsRequested { interaction_id, .. } => {
+                ProviderEvent::TextDelta { turn_id, .. }
+                | ProviderEvent::ThinkingDelta { turn_id, .. }
+                | ProviderEvent::ToolStarted { turn_id, .. }
+                | ProviderEvent::ToolCompleted { turn_id, .. } => in_turn(running, turn_id, e),
+                ProviderEvent::ApprovalRequested {
+                    turn_id,
+                    interaction_id,
+                    ..
+                }
+                | ProviderEvent::QuestionsRequested {
+                    turn_id,
+                    interaction_id,
+                    ..
+                } => {
+                    in_turn(running, turn_id, e);
                     open.insert(interaction_id, true);
                 }
-                ProviderEvent::InteractionResolved { interaction_id, .. } => {
+                ProviderEvent::InteractionResolved {
+                    turn_id,
+                    interaction_id,
+                    resolution,
+                } => {
                     let was_open = open.insert(interaction_id, false);
-                    assert_eq!(
-                        was_open,
-                        Some(true),
-                        "interaction {interaction_id} resolved while not open"
-                    );
+                    // The one allowed repeat: an answer that never reached Claude is corrected
+                    // to Cancelled (possibly after its turn has ended).
+                    let correction =
+                        was_open == Some(false) && *resolution == Resolution::Cancelled;
+                    if !correction {
+                        assert_eq!(
+                            was_open,
+                            Some(true),
+                            "interaction {interaction_id} resolved while not open"
+                        );
+                        in_turn(running, turn_id, e);
+                    }
                 }
                 _ => {}
             }

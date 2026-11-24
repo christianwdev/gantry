@@ -62,6 +62,8 @@ pub enum SessionError {
     Exited,
     #[error("the session is shutting down")]
     ShuttingDown,
+    #[error("claude exited, but processes it started could not be stopped")]
+    TreeNotEmpty,
     #[error("claude failed to start: {cause}{}", stderr_suffix(stderr))]
     StartupFailed {
         cause: Box<SessionError>,
@@ -91,6 +93,8 @@ struct State {
     exited: bool,
     /// Shutdown has begun: no new turns or config changes (only the shutdown's interrupt).
     stopping: bool,
+    /// The worker exited on its own and helpers it started could not be reaped.
+    tree_left_behind: bool,
     /// The only sender of the event stream: dropped on termination so the stream ends.
     events: Option<mpsc::UnboundedSender<ProviderEvent>>,
     /// Control requests whose waiter gave up (timeout / dropped future), by kind: Claude may
@@ -179,6 +183,21 @@ impl Drop for PendingControl<'_> {
     }
 }
 
+/// Lifts `stopping` again if a `shutdown()` is cancelled before the actor got its request
+/// (the worker keeps running and must stay usable).
+struct StoppingGuard<'a> {
+    shared: &'a Shared,
+    armed: bool,
+}
+
+impl Drop for StoppingGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.lock().stopping = false;
+        }
+    }
+}
+
 /// Undoes an optimistic state change if the frame never reached Claude — including when the
 /// sending future is cancelled mid-write (e.g. a caller's timeout while the stdin queue is
 /// full): a started turn is aborted; an answered interaction is put back and re-announced
@@ -217,7 +236,11 @@ impl Drop for Undeliverable<'_> {
                 if *clear_interrupt {
                     state.normalizer.clear_interrupt_requested(&pending.turn_id);
                 }
-                if state.exited {
+                // Re-announce only while its turn is still running: a card for a finished turn
+                // (or a stopping/exited worker) can never be answered, so cancel it instead.
+                let turn_running =
+                    state.normalizer.active_turn().map(String::as_str) == Some(&*pending.turn_id);
+                if state.exited || state.stopping || !turn_running {
                     undelivered(&pending.turn_id, interaction_id)
                 } else {
                     state
@@ -295,6 +318,7 @@ impl ClaudeSession {
                 next_turn: 0,
                 exited: false,
                 stopping: false,
+                tree_left_behind: false,
                 events: Some(events_tx),
                 late_controls: HashMap::new(),
             }),
@@ -459,6 +483,10 @@ impl ClaudeSession {
         // also makes a double answer fail with UnknownInteraction instead of answering twice.
         let (frame, pending, set_interrupt) = {
             let mut state = self.shared.lock();
+            // Shutdown's interrupt / stdin close already cancels the interaction.
+            if state.stopping {
+                return Err(SessionError::ShuttingDown);
+            }
             let pending = state
                 .normalizer
                 .pending(interaction_id)
@@ -524,6 +552,9 @@ impl ClaudeSession {
             .collect();
         let frame = {
             let mut state = self.shared.lock();
+            if state.stopping {
+                return Err(SessionError::ShuttingDown);
+            }
             let pending = state
                 .normalizer
                 .pending(interaction_id)
@@ -618,8 +649,17 @@ impl ClaudeSession {
     /// Idempotent: returns `Ok(None)` if the worker had already exited.
     pub async fn shutdown(&self) -> Result<Option<Shutdown>> {
         // From here on no new turn or config change can start a request that would only be
-        // cut off (or killed) a moment later.
-        self.shared.lock().stopping = true;
+        // cut off (or killed) a moment later. If this call is cancelled before the actor has
+        // the request, the worker keeps running, so the guard lifts the flag again.
+        let mut guard = {
+            let mut state = self.shared.lock();
+            let set_here = !state.stopping;
+            state.stopping = true;
+            StoppingGuard {
+                shared: &self.shared,
+                armed: set_here,
+            }
+        };
         if self.active_turn().is_some() {
             // A turn cut short by shutdown is an interrupt the user asked for, even if the
             // process exits before Claude reports a result.
@@ -638,8 +678,9 @@ impl ClaudeSession {
             .await
             .is_err()
         {
-            return Ok(None);
+            return self.already_stopped();
         }
+        guard.armed = false;
         tokio::select! {
             // A reply wins over termination: the ladder's outcome is the answer.
             biased;
@@ -647,10 +688,21 @@ impl ClaudeSession {
                 Ok(Some(outcome)) => outcome.map(Some).map_err(SessionError::Shutdown),
                 // Already stopped by an earlier shutdown, or the actor ended (process gone)
                 // before running the ladder.
-                Ok(None) | Err(_) => Ok(None),
+                Ok(None) | Err(_) => self.already_stopped(),
             },
             // The actor finished without reading the command.
-            _ = terminated.wait_for(|done| *done) => Ok(None),
+            _ = terminated.wait_for(|done| *done) => self.already_stopped(),
+        }
+    }
+
+    /// The worker was already stopped: `Ok(None)`, unless helpers it left behind could not be
+    /// reaped (then the caller must not treat the tree as gone, e.g. before removing a
+    /// worktree).
+    fn already_stopped(&self) -> Result<Option<Shutdown>> {
+        if self.shared.lock().tree_left_behind {
+            Err(SessionError::TreeNotEmpty)
+        } else {
+            Ok(None)
         }
     }
 
@@ -883,36 +935,48 @@ async fn run(
     }
 
     // A ladder may still be running: get the process back from it before the final wait.
-    let mut child = match child {
-        Some(c) => c,
+    // Our own sender goes first, so a ladder task that panicked ends the wait instead of
+    // hanging it (its `ManagedChild` was dropped with it, which closes the job and kills the
+    // tree).
+    drop(ladder_tx);
+    let child = match child {
+        Some(c) => Some(c),
         None => match ladder_rx.recv().await {
             Some((c, outcome)) => {
                 ladder_done = true;
                 if let Some(reply) = ladder_reply.take() {
                     let _ = reply.send(Some(outcome));
                 }
-                c
+                Some(c)
             }
-            None => unreachable!("this task holds a ladder sender"),
+            None => {
+                tracing::error!("the shutdown ladder task ended without returning the process");
+                ladder_done = true;
+                None
+            }
         },
     };
-    let exit_code = match child.wait_timeout(Duration::from_secs(5)).await {
-        Ok(Some(status)) => Some(status.code()),
-        _ => None,
-    };
-    // The process ended on its own (crash, exit): helpers it started may still be running in
-    // its job. Reap them before reporting termination, so "terminated" (and a later
-    // `shutdown() == Ok(None)`) means the tree is gone — e.g. before a worktree is removed.
-    if !ladder_done {
-        let _ = child.kill_tree();
-        if !matches!(
-            child.job().wait_until_empty(SHUTDOWN_KILL_AFTER).await,
-            Ok(true)
-        ) {
-            shared.lock().emit(vec![ProviderEvent::Other {
-                kind: "process_tree_not_empty".into(),
-                frame: Value::Null,
-            }]);
+    let mut exit_code = None;
+    if let Some(mut child) = child {
+        if let Ok(Some(status)) = child.wait_timeout(Duration::from_secs(5)).await {
+            exit_code = Some(status.code());
+        }
+        // The process ended on its own (crash, exit): helpers it started may still be running
+        // in its job. Reap them before reporting termination, so "terminated" (and a later
+        // `shutdown() == Ok(None)`) means the tree is gone — e.g. before a worktree is removed.
+        if !ladder_done {
+            let _ = child.kill_tree();
+            if !matches!(
+                child.job().wait_until_empty(SHUTDOWN_KILL_AFTER).await,
+                Ok(true)
+            ) {
+                let mut state = shared.lock();
+                state.tree_left_behind = true;
+                state.emit(vec![ProviderEvent::Other {
+                    kind: "process_tree_not_empty".into(),
+                    frame: Value::Null,
+                }]);
+            }
         }
     }
     // Let stderr drain to EOF (bounded) so a crash's last lines — usually the reason — are
@@ -1078,6 +1142,7 @@ mod tests {
                 next_turn: 0,
                 exited: false,
                 stopping: false,
+                tree_left_behind: false,
                 events: None,
                 late_controls: HashMap::new(),
             }),
@@ -1109,6 +1174,7 @@ mod tests {
             next_turn: 0,
             exited: false,
             stopping: false,
+            tree_left_behind: false,
             events: Some(tx),
             late_controls: HashMap::new(),
         };

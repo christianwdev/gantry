@@ -3,9 +3,11 @@
 //!
 //! Reads the fixture named by `FAKE_CLAUDE_FIXTURE` (NDJSON lines `{"dir":"in"|"out",
 //! "frame":{...}}`, as written by `ClaudeConfig::raw_log`). For every recorded `in` frame it
-//! reads one line from stdin (checking the frame type matches); every `out` frame is printed.
+//! reads one line from stdin, which must equal the recorded frame; every `out` frame is printed.
 //! Request ids Gantry generates are remapped from the recording to the live run, so the
-//! replayed `control_response`s answer the requests actually sent. All CLI args are ignored.
+//! replayed `control_response`s answer the requests actually sent. Any divergence (a different
+//! frame, stdin closing early, input after the end) is reported on stderr as `fake-claude: ...`
+//! with exit code 3, which the test harness fails on. All CLI args are ignored.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -36,7 +38,11 @@ fn main() {
             Some("in") => {
                 let mut got = String::new();
                 if input.read_line(&mut got).unwrap_or(0) == 0 {
-                    return; // Gantry closed stdin: end of session
+                    // Gantry closed stdin before writing a frame the recording says it wrote.
+                    fail(&format!(
+                        "fixture line {}: stdin closed, expected {frame}",
+                        n + 1
+                    ));
                 }
                 let mut actual: Value = serde_json::from_str(got.trim()).unwrap_or(Value::Null);
                 // Gantry's own request ids are remapped, not compared; everything else Gantry
@@ -74,7 +80,20 @@ fn main() {
                 writeln!(out, "{frame}").unwrap();
                 out.flush().unwrap();
             }
-            // Hand-written fixtures only: simulate the process dying at this point...
+            // Hand-written fixtures only: Gantry closes stdin here (nothing more is written);
+            // like the real CLI, stop without a result...
+            Some("eof") => {
+                let mut extra = String::new();
+                if input.read_line(&mut extra).unwrap_or(0) > 0 {
+                    fail(&format!(
+                        "fixture line {}: expected stdin to close, got {}",
+                        n + 1,
+                        extra.trim()
+                    ));
+                }
+                return;
+            }
+            // ...simulate the process dying at this point...
             Some("exit") => std::process::exit(record["code"].as_i64().unwrap_or(1) as i32),
             // ...a slow reply...
             Some("sleep") => std::thread::sleep(std::time::Duration::from_millis(
