@@ -72,15 +72,16 @@ fn focus_main_window(app: &AppHandle) {
 ///
 /// # Panics
 ///
-/// Panics if the Tauri runtime fails to start, or (debug builds only) if the
-/// TypeScript bindings cannot be exported.
+/// Panics if the Tauri runtime fails to start.
 pub fn run() {
     let builder = specta_builder();
 
+    // Dev convenience only: a debug binary run outside the source tree (where the baked-in
+    // path does not exist) must still start. The bindings test is the authoritative export.
     #[cfg(debug_assertions)]
-    builder
-        .export(specta_typescript::Typescript::default(), BINDINGS_PATH)
-        .expect("failed to export TypeScript bindings");
+    if let Err(e) = builder.export(specta_typescript::Typescript::default(), BINDINGS_PATH) {
+        eprintln!("warning: could not export TypeScript bindings to {BINDINGS_PATH}: {e}");
+    }
 
     tauri::Builder::default()
         // Must be registered first so a second launch exits before doing any work.
@@ -96,7 +97,7 @@ pub fn run() {
         .expect("error while running Gantry");
 }
 
-#[cfg(test)]
+#[cfg(all(test, debug_assertions))]
 mod tests {
     use super::{BINDINGS_PATH, specta_builder};
 

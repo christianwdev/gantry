@@ -7,9 +7,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::windows::named_pipe::NamedPipeServer;
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use tokio::sync::{mpsc, oneshot};
+use windows_sys::Win32::Foundation::{
+    HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
@@ -121,8 +124,9 @@ impl ManagedCommand {
         self
     }
 
-    /// Places the child in an existing job (e.g. a workspace's shared job). By default each
-    /// spawn gets its own fresh job.
+    /// Also places the child in a group job (e.g. a workspace's), for whole-group teardown and
+    /// accounting. The child still gets its own job, nested under the group, so shutting it
+    /// down never affects its siblings.
     pub fn job(&mut self, job: Arc<Job>) -> &mut Self {
         self.job = Some(job);
         self
@@ -184,10 +188,8 @@ impl ManagedCommand {
             None => None,
         };
 
-        let job = match &self.job {
-            Some(job) => Arc::clone(job),
-            None => Arc::new(Job::new()?),
-        };
+        // Every child gets its own job so it can be torn down without touching siblings.
+        let job = Arc::new(Job::new()?);
 
         let (stdin_parent, stdin_child) = stdio_end(self.stdin, Direction::ChildReads)?;
         let (stdout_parent, stdout_child) = stdio_end(self.stdout, Direction::ChildWrites)?;
@@ -198,7 +200,13 @@ impl ManagedCommand {
             stdout_child.as_raw_handle() as HANDLE,
             stderr_child.as_raw_handle() as HANDLE,
         ];
-        let jobs: [HANDLE; 1] = [job.raw()];
+        // Order matters: the process joins the group first, then its own (empty) job, which
+        // Windows therefore nests *under* the group. Terminating or closing the group still
+        // kills everything; terminating the child's job kills only its subtree.
+        let jobs: Vec<HANDLE> = match &self.job {
+            Some(group) => vec![group.raw(), job.raw()],
+            None => vec![job.raw()],
+        };
         let attrs = AttributeList::new(&inherit, &jobs)?;
 
         // SAFETY: zero is a valid bit pattern for these plain-old-data structs.
@@ -211,6 +219,20 @@ impl ManagedCommand {
         si.lpAttributeList = attrs.as_ptr();
         // SAFETY: as above.
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+        // The child ends are created non-inheritable and only flipped to inheritable here, for
+        // the few microseconds around CreateProcessW (they are closed right after). Foreign
+        // spawns elsewhere in the process (std::process inside a dependency, Tauri internals)
+        // inherit *every* inheritable handle, so this keeps that leak window as small as
+        // Windows allows; our own spawns are already isolated by the handle list.
+        for &handle in &inherit {
+            // SAFETY: `handle` is a valid handle we own for the duration of this call.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+                == 0
+            {
+                return Err(Error::last_os("SetHandleInformation"));
+            }
+        }
 
         let flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
         // SAFETY: every pointer is valid for the duration of the call: NUL-terminated
@@ -254,6 +276,7 @@ impl ManagedCommand {
             process,
             job,
             status: None,
+            stdin_close: None,
             stdin: stdin_parent.map(ChildStdin),
             stdout: stdout_parent.map(ChildStdout),
             stderr: stderr_parent.map(ChildStderr),
@@ -363,9 +386,10 @@ impl std::fmt::Display for ExitStatus {
 
 /// A running (or exited) managed child process.
 ///
-/// Dropping a `ManagedChild` does **not** kill it on its own; the process (and its descendants)
-/// die when the last `Arc<Job>` referencing its job is dropped. A child spawned without an
-/// explicit job owns the only reference, so dropping the child kills its whole tree.
+/// Every child has its **own** job (see [`ManagedChild::job`]), nested inside the group job
+/// given to [`ManagedCommand::job`] if any. Dropping the `ManagedChild` drops its job's last
+/// reference (unless you cloned it), which kills the child and all its descendants — but never
+/// siblings in the same group.
 #[derive(Debug)]
 pub struct ManagedChild {
     pid: u32,
@@ -373,9 +397,42 @@ pub struct ManagedChild {
     process: OwnedHandle,
     job: Arc<Job>,
     status: Option<ExitStatus>,
+    stdin_close: Option<oneshot::Sender<()>>,
+    /// Raw stdin. Prefer [`ManagedChild::stdin_writer`]: if you `take()` this, the shutdown
+    /// ladder can no longer close stdin for you.
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
+}
+
+/// Cloneable, queue-backed handle to a child's stdin, served by a dedicated writer task.
+///
+/// The task owns the pipe exclusively (no pipe deadlocks from interleaved I/O) and drops it —
+/// delivering EOF to the child — when every writer is dropped or when
+/// [`ManagedChild::shutdown`] / [`ManagedChild::close_stdin`] asks it to, even mid-write.
+#[derive(Debug, Clone)]
+pub struct StdinWriter {
+    tx: mpsc::Sender<Vec<u8>>,
+}
+
+impl StdinWriter {
+    /// Queues bytes for the child, waiting while the queue is full.
+    ///
+    /// Fails with `BrokenPipe` once stdin is closed or the child stopped reading.
+    pub async fn send(&self, bytes: impl Into<Vec<u8>>) -> io::Result<()> {
+        self.tx
+            .send(bytes.into())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "child stdin is closed"))
+    }
+
+    /// Queues one NDJSON frame (`line` + `\n`).
+    pub async fn send_line(&self, line: &str) -> io::Result<()> {
+        let mut bytes = Vec::with_capacity(line.len() + 1);
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        self.send(bytes).await
+    }
 }
 
 impl ManagedChild {
@@ -388,9 +445,52 @@ impl ManagedChild {
         &self.program
     }
 
-    /// The job containing this process and all its descendants.
+    /// This child's own job: exactly this process and its descendants (plus their
+    /// `conhost.exe` instances). Terminating it never affects siblings in a group job.
     pub fn job(&self) -> &Arc<Job> {
         &self.job
+    }
+
+    /// Moves stdin into a dedicated writer task with a queue of `capacity` frames and returns
+    /// a cloneable handle to it. `None` if stdin was not piped or was already taken.
+    ///
+    /// Must be called within a Tokio runtime.
+    pub fn stdin_writer(&mut self, capacity: usize) -> Option<StdinWriter> {
+        let mut pipe = self.stdin.take()?;
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(capacity.max(1));
+        let (close_tx, mut close_rx) = oneshot::channel::<()>();
+        self.stdin_close = Some(close_tx);
+        tokio::spawn(async move {
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    _ = &mut close_rx => break,
+                    frame = rx.recv() => match frame {
+                        Some(frame) => frame,
+                        None => break,
+                    },
+                };
+                // A full pipe (child not reading) must not block a close request.
+                let wrote = tokio::select! {
+                    biased;
+                    _ = &mut close_rx => break,
+                    res = pipe.write_all(&frame) => res.is_ok(),
+                };
+                if !wrote {
+                    break;
+                }
+            }
+            // Dropping `pipe` here closes the server end: the child reads EOF.
+        });
+        Some(StdinWriter { tx })
+    }
+
+    /// Closes stdin (EOF) whether it is still held here or owned by a [`StdinWriter`] task.
+    pub fn close_stdin(&mut self) {
+        self.stdin = None;
+        if let Some(close) = self.stdin_close.take() {
+            let _ = close.send(());
+        }
     }
 
     fn raw(&self) -> HANDLE {
@@ -442,24 +542,35 @@ impl ManagedChild {
     }
 
     /// `TerminateProcess` on this process **only**. Descendants keep running inside the job;
-    /// use [`Job::terminate`] (or drop the job) to kill the whole tree.
+    /// use [`ManagedChild::kill_tree`] to kill the whole tree.
     pub fn kill(&mut self) -> Result<()> {
         if self.try_wait()?.is_some() {
             return Ok(());
         }
         // SAFETY: valid process handle with PROCESS_TERMINATE from CreateProcessW.
-        if unsafe { TerminateProcess(self.raw(), 1) } == 0 && self.try_wait()?.is_none() {
-            return Err(Error::last_os("TerminateProcess"));
+        if unsafe { TerminateProcess(self.raw(), 1) } == 0 {
+            // Capture before try_wait's own Win32 calls overwrite the thread's last error.
+            let err = Error::last_os("TerminateProcess");
+            if self.try_wait()?.is_none() {
+                return Err(err);
+            }
         }
         Ok(())
+    }
+
+    /// Terminates this child and all its descendants (its own job only; group siblings are
+    /// unaffected).
+    pub fn kill_tree(&self) -> Result<()> {
+        self.job.terminate(1)
     }
 
     /// The graceful cancellation ladder (research doc §4.2), run *after* the caller has already
     /// sent its protocol-native cancel (`interrupt` / `turn/interrupt` / `session/cancel`):
     ///
     /// 1. wait `eof_after` for a clean exit;
-    /// 2. close stdin (EOF) and wait until `kill_after` (measured from the start);
-    /// 3. terminate the whole job and wait for the process.
+    /// 2. close stdin (EOF) — including a [`StdinWriter`] task's pipe — and wait until
+    ///    `kill_after` (measured from the start);
+    /// 3. terminate this child's own job (its whole tree, never group siblings) and wait.
     pub async fn shutdown(
         &mut self,
         eof_after: Duration,
@@ -469,15 +580,15 @@ impl ManagedChild {
             return Ok(status);
         }
         tracing::debug!(pid = self.pid, "shutdown ladder: closing stdin");
-        self.stdin = None;
+        self.close_stdin();
         if let Some(status) = self
             .wait_timeout(kill_after.saturating_sub(eof_after))
             .await?
         {
             return Ok(status);
         }
-        tracing::warn!(pid = self.pid, "shutdown ladder: terminating job");
-        self.job.terminate(1)?;
+        tracing::warn!(pid = self.pid, "shutdown ladder: terminating process tree");
+        self.kill_tree()?;
         self.wait().await
     }
 }

@@ -3,6 +3,13 @@ import { Suspense, use } from "react";
 import { commands } from "@gantry/protocol";
 
 type ToolStatus = Awaited<ReturnType<typeof commands.toolHealth>>[number];
+const STATE_LABEL: Record<ToolStatus["state"], string> = {
+  ok: "ok",
+  missing: "not found",
+  shimOnly: "shim only (.cmd)",
+  failed: "probe failed",
+};
+
 type ToolsResult = { ok: true; tools: ToolStatus[] } | { ok: false; error: string };
 
 // Probed once per app session; a "re-check" action can come with the real health system.
@@ -26,13 +33,14 @@ function ToolList() {
   return (
     <ul className="tools">
       {result.tools.map((tool) => {
-        const healthy = tool.version !== null;
+        const healthy = tool.state === "ok";
+        const tooltip = [tool.path, tool.error].filter(Boolean).join("\n") || undefined;
         return (
-          <li key={tool.program} className="tool" title={tool.path ?? tool.error ?? undefined}>
+          <li key={tool.program} className="tool" title={tooltip}>
             <span className={healthy ? "dot dot-ok" : "dot dot-missing"} aria-hidden="true" />
             <span className="tool-name">{tool.name}</span>
             <span className={healthy ? "tool-detail" : "tool-detail error"}>
-              {tool.version ?? (tool.path === null ? "not found" : "probe failed")}
+              {healthy ? tool.version : STATE_LABEL[tool.state]}
             </span>
           </li>
         );

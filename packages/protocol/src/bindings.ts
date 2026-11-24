@@ -39,6 +39,20 @@ export type AppInfo_Serialize = {
 	webviewVersion: string | null,
 };
 
+/**  Overall outcome of probing one CLI. */
+export type ToolState = 
+/**  Resolved and reported a version. */
+"ok" | 
+/**  Not found on the (merged process + registry) `PATH`. */
+"missing" | 
+/**
+ *  Only a `.cmd`/`.bat`/`.ps1` shim exists (e.g. an npm global install); Gantry needs the
+ *  real executable.
+ */
+"shimOnly" | 
+/**  Found, but `--version` failed, timed out or printed nothing. */
+"failed";
+
 /**  Result of probing one external CLI. */
 export type ToolStatus = ToolStatus_Serialize | ToolStatus_Deserialize;
 
@@ -48,11 +62,12 @@ export type ToolStatus_Deserialize = {
 	name: string,
 	/**  The program name that was resolved. */
 	program: string,
-	/**  The resolved executable, if found. */
+	state: ToolState,
+	/**  The resolved executable (or the rejected shim), if any. */
 	path?: string | null,
-	/**  First line of `--version` output, if the probe succeeded. */
+	/**  First non-empty line of `--version` output, when `state` is `ok`. */
 	version?: string | null,
-	/**  Why resolution or the probe failed. */
+	/**  Human-readable reason when `state` is not `ok`. */
 	error?: string | null,
 };
 
@@ -62,10 +77,11 @@ export type ToolStatus_Serialize = {
 	name: string,
 	/**  The program name that was resolved. */
 	program: string,
-	/**  The resolved executable, if found. */
+	state: ToolState,
+	/**  The resolved executable (or the rejected shim), if any. */
 	path: string | null,
-	/**  First line of `--version` output, if the probe succeeded. */
+	/**  First non-empty line of `--version` output, when `state` is `ok`. */
 	version: string | null,
-	/**  Why resolution or the probe failed. */
+	/**  Human-readable reason when `state` is not `ok`. */
 	error: string | null,
 };

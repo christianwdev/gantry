@@ -31,7 +31,7 @@ pub(crate) enum Direction {
     ChildWrites,
 }
 
-/// Creates a connected pipe pair: `(server end for Gantry, inheritable client end for the child)`.
+/// Creates a connected pipe pair: `(server end for Gantry, client end for the child)`.
 ///
 /// Must be called within a Tokio runtime (the server end registers with the reactor).
 pub(crate) fn pipe_pair(direction: Direction) -> Result<(NamedPipeServer, OwnedHandle)> {
@@ -56,7 +56,7 @@ pub(crate) fn pipe_pair(direction: Direction) -> Result<(NamedPipeServer, OwnedH
         Direction::ChildReads => GENERIC_READ,
         Direction::ChildWrites => GENERIC_WRITE,
     };
-    let client = open_inheritable(OsStr::new(&name), access, 0)?;
+    let client = open_child_end(OsStr::new(&name), access, 0)?;
     // max_instances(1): now that our client holds the only instance, nobody else can attach.
     complete_connect(&server)?;
     Ok((server, client))
@@ -79,27 +79,27 @@ fn complete_connect(server: &NamedPipeServer) -> Result<()> {
     }
 }
 
-/// Opens the `NUL` device as an inheritable handle for `Stdio::Null`.
+/// Opens the `NUL` device for `Stdio::Null`.
 pub(crate) fn null_handle(direction: Direction) -> Result<OwnedHandle> {
     let access = match direction {
         Direction::ChildReads => GENERIC_READ,
         Direction::ChildWrites => GENERIC_WRITE,
     };
-    open_inheritable(
+    open_child_end(
         OsStr::new("NUL"),
         access,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
     )
 }
 
-/// Opens `path` with an inheritable handle. Inheritance is still restricted per spawn by
-/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, so this handle can only reach the intended child.
-fn open_inheritable(path: &OsStr, access: u32, share: u32) -> Result<OwnedHandle> {
+/// Opens `path` as a **non-inheritable** handle; `spawn` makes it inheritable only for the
+/// instant around `CreateProcessW`, where the handle list limits it to the intended child.
+fn open_child_end(path: &OsStr, access: u32, share: u32) -> Result<OwnedHandle> {
     let wide = wide_nul(path);
     let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: 1,
+        bInheritHandle: 0,
     };
     // SAFETY: `wide` is NUL-terminated and `sa` is a valid SECURITY_ATTRIBUTES.
     let raw = unsafe {

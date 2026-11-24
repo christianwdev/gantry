@@ -42,6 +42,7 @@ pub use error::{Error, Result};
 pub use job::Job;
 pub use paths::normalize_path;
 pub use process::{
-    ChildStderr, ChildStdin, ChildStdout, ExitStatus, ManagedChild, ManagedCommand, Stdio,
+    ChildStderr, ChildStdin, ChildStdout, ExitStatus, ManagedChild, ManagedCommand, StdinWriter,
+    Stdio,
 };
 pub use wait::is_process_alive;

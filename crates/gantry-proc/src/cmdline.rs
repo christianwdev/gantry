@@ -6,6 +6,10 @@ use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
+use windows_sys::Win32::Globalization::{
+    CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal,
+};
+
 use crate::{Error, Result};
 
 const QUOTE: u16 = b'"' as u16;
@@ -75,17 +79,20 @@ fn append_arg(out: &mut Vec<u16>, arg: &OsStr) -> Result<()> {
 }
 
 /// Case-insensitive comparison of environment variable names, matching how Windows orders and
-/// deduplicates them (ordinal, upper-cased UTF-16).
+/// deduplicates them: ordinal comparison with the OS's own Unicode upper-casing table.
 pub(crate) fn env_key_cmp(a: &OsStr, b: &OsStr) -> Ordering {
-    let upper = |s: &OsStr| -> Vec<u16> {
-        s.encode_wide()
-            .map(|c| match c {
-                0x61..=0x7A => c - 0x20,
-                _ => c,
-            })
-            .collect()
-    };
-    upper(a).cmp(&upper(b))
+    let a: Vec<u16> = a.encode_wide().collect();
+    let b: Vec<u16> = b.encode_wide().collect();
+    // SAFETY: both buffers are valid for the explicit lengths passed (no NUL needed).
+    let r =
+        unsafe { CompareStringOrdinal(a.as_ptr(), a.len() as i32, b.as_ptr(), b.len() as i32, 1) };
+    match r {
+        CSTR_LESS_THAN => Ordering::Less,
+        CSTR_GREATER_THAN => Ordering::Greater,
+        CSTR_EQUAL => Ordering::Equal,
+        // Only fails on invalid arguments; fall back to a raw ordinal comparison.
+        _ => a.cmp(&b),
+    }
 }
 
 /// A case-insensitive environment map with Windows semantics.
@@ -128,16 +135,17 @@ impl EnvMap {
     pub(crate) fn to_block(&self) -> Result<Vec<u16>> {
         let mut block = Vec::with_capacity(4096);
         for (k, v) in &self.entries {
-            let start = block.len();
-            block.extend(k.encode_wide());
-            if block[start..].contains(&0)
-                || k.is_empty()
-                || block[start + 1..].contains(&(b'=' as u16))
-            {
+            let name: Vec<u16> = k.encode_wide().collect();
+            if name.contains(&0) {
                 return Err(Error::InteriorNul {
                     what: "environment variable name",
                 });
             }
+            // A leading '=' is legal: cmd.exe's hidden per-drive cwd entries look like "=C:".
+            if name.is_empty() || name[1..].contains(&(b'=' as u16)) {
+                return Err(Error::InvalidEnvName { name: k.clone() });
+            }
+            block.extend_from_slice(&name);
             block.push(b'=' as u16);
             let vstart = block.len();
             block.extend(v.encode_wide());
@@ -211,6 +219,33 @@ mod tests {
         assert_eq!(block, "alpha=1\0PATH=b\0ZED=z\0\0");
         env.remove(OsStr::new("pAtH"));
         assert_eq!(env.get(OsStr::new("PATH")), None);
+    }
+
+    #[test]
+    fn env_keys_fold_non_ascii_case() {
+        let mut env = EnvMap::default();
+        env.set("ÄPFEL".into(), "1".into());
+        env.set("äpfel".into(), "2".into());
+        assert_eq!(env.get(OsStr::new("Äpfel")), Some(OsStr::new("2")));
+        assert_eq!(
+            String::from_utf16(&env.to_block().unwrap()).unwrap(),
+            "äpfel=2\0\0"
+        );
+    }
+
+    #[test]
+    fn invalid_env_names_are_reported_as_such() {
+        for bad in ["", "A=B"] {
+            let mut env = EnvMap::default();
+            env.set(bad.into(), "x".into());
+            assert!(
+                matches!(env.to_block(), Err(Error::InvalidEnvName { .. })),
+                "{bad:?}"
+            );
+        }
+        let mut env = EnvMap::default();
+        env.set("=C:".into(), r"C:\".into());
+        assert!(env.to_block().is_ok());
     }
 
     #[test]

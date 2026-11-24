@@ -441,6 +441,86 @@ async fn direct_child_has_no_console_window() {
     assert_eq!(out.trim(), "null");
 }
 
+/// Review fix: shutting down one member of a group job must not kill its siblings, while
+/// terminating the group still kills everyone (each child's job is nested under the group).
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_of_one_group_member_spares_its_siblings() {
+    let dir = scratch_dir("group");
+    let group = Arc::new(Job::new().unwrap());
+    let mut victim = ManagedCommand::new(FIXTURE)
+        .args(["tree", &dir.to_string_lossy(), "1"])
+        .stdin(Stdio::Piped)
+        .job(Arc::clone(&group))
+        .spawn()
+        .unwrap();
+    let mut sibling = ManagedCommand::new(FIXTURE)
+        .arg("sleep")
+        .job(Arc::clone(&group))
+        .spawn()
+        .unwrap();
+    let victim_tree = wait_for("victim tree", Duration::from_secs(30), || {
+        let p = victim.job().process_ids().unwrap();
+        (tree_reports(&dir).len() == 2).then_some(p)
+    })
+    .await;
+    let watched = Watched::open(victim_tree.iter().copied().filter(|&p| p != sibling.id()));
+
+    let status = victim
+        .shutdown(Duration::from_millis(50), Duration::from_millis(150))
+        .await
+        .unwrap();
+    assert_eq!(status.code(), 1);
+    assert_eq!(
+        watched.survivors_after(Duration::from_secs(5)),
+        Vec::<u32>::new()
+    );
+    assert!(
+        sibling.try_wait().unwrap().is_none(),
+        "sibling in the shared group was killed by another member's shutdown"
+    );
+
+    group.terminate(9).unwrap();
+    assert_eq!(sibling.wait().await.unwrap().code(), 9);
+    assert!(
+        group
+            .wait_until_empty(Duration::from_secs(5))
+            .await
+            .unwrap()
+    );
+}
+
+/// Review fix: the shutdown ladder must deliver EOF even when stdin was handed to a writer
+/// task (and a `StdinWriter` clone is still alive).
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_closes_stdin_owned_by_writer_task() {
+    let mut child = ManagedCommand::new(FIXTURE)
+        .arg("echo")
+        .stdin(Stdio::Piped)
+        .stdout(Stdio::Piped)
+        .spawn()
+        .unwrap();
+    let writer = child.stdin_writer(8).unwrap();
+    assert!(child.stdin.is_none());
+    let mut out = LineReader::new(child.stdout.take().unwrap(), DEFAULT_MAX_LINE);
+    writer.send_line("hello").await.unwrap();
+    assert_eq!(
+        out.next_line().await.unwrap(),
+        Some(Line::Text("echo:hello".into()))
+    );
+
+    let t = Instant::now();
+    let status = child
+        .shutdown(Duration::from_millis(100), Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(
+        status.success(),
+        "echo should exit cleanly on EOF, got {status}"
+    );
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(writer.send_line("too late").await.is_err());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_ladder_prefers_eof_then_kills() {
     // Exits cleanly once stdin closes (step 2).

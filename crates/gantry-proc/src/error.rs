@@ -21,6 +21,10 @@ pub enum Error {
     #[error("{what} contains an interior NUL character")]
     InteriorNul { what: &'static str },
 
+    /// An environment variable name was empty or contained `=` (after its first character).
+    #[error("invalid environment variable name `{}`", name.display())]
+    InvalidEnvName { name: OsString },
+
     /// A Win32 call failed.
     #[error("{op} failed: {source}")]
     Win32 {

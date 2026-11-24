@@ -23,6 +23,21 @@ const TOOLS: &[(&str, &str, &[&str])] = &[
     ("Bun", "bun", &["--version"]),
 ];
 
+/// Overall outcome of probing one CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolState {
+    /// Resolved and reported a version.
+    Ok,
+    /// Not found on the (merged process + registry) `PATH`.
+    Missing,
+    /// Only a `.cmd`/`.bat`/`.ps1` shim exists (e.g. an npm global install); Gantry needs the
+    /// real executable.
+    ShimOnly,
+    /// Found, but `--version` failed, timed out or printed nothing.
+    Failed,
+}
+
 /// Result of probing one external CLI.
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -31,11 +46,12 @@ pub struct ToolStatus {
     pub name: String,
     /// The program name that was resolved.
     pub program: String,
-    /// The resolved executable, if found.
+    pub state: ToolState,
+    /// The resolved executable (or the rejected shim), if any.
     pub path: Option<String>,
-    /// First line of `--version` output, if the probe succeeded.
+    /// First non-empty line of `--version` output, when `state` is `ok`.
     pub version: Option<String>,
-    /// Why resolution or the probe failed.
+    /// Human-readable reason when `state` is not `ok`.
     pub error: Option<String>,
 }
 
@@ -56,6 +72,7 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
     let mut status = ToolStatus {
         name: name.to_owned(),
         program: program.to_owned(),
+        state: ToolState::Failed,
         path: None,
         version: None,
         error: None,
@@ -68,6 +85,14 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
     match cmd.resolve_program() {
         Ok(path) => status.path = Some(path.display().to_string()),
         Err(e) => {
+            status.state = match &e {
+                gantry_proc::Error::NotFound { .. } => ToolState::Missing,
+                gantry_proc::Error::ShimOnly { shim, .. } => {
+                    status.path = Some(shim.display().to_string());
+                    ToolState::ShimOnly
+                }
+                _ => ToolState::Failed,
+            };
             status.error = Some(e.to_string());
             return status;
         }
@@ -75,20 +100,24 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
 
     let run = async {
         let mut child = cmd.spawn()?;
-        let mut out = String::new();
+        let mut out = Vec::new();
         if let Some(stdout) = child.stdout.as_mut() {
-            stdout.read_to_string(&mut out).await?;
+            stdout.read_to_end(&mut out).await?;
         }
         let exit = child.wait().await?;
-        Ok::<_, gantry_proc::Error>((exit, out))
+        Ok::<_, gantry_proc::Error>((exit, String::from_utf8_lossy(&out).into_owned()))
     };
     match tokio::time::timeout(PROBE_TIMEOUT, run).await {
         Ok(Ok((exit, out))) if exit.success() => {
-            status.version = out
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .map(str::to_owned);
+            match out.lines().map(str::trim).find(|l| !l.is_empty()) {
+                Some(line) => {
+                    status.state = ToolState::Ok;
+                    status.version = Some(line.to_owned());
+                }
+                None => {
+                    status.error = Some(format!("`{program} --version` printed no version"));
+                }
+            }
         }
         Ok(Ok((exit, _))) => status.error = Some(format!("`{program} --version` failed: {exit}")),
         Ok(Err(e)) => status.error = Some(e.to_string()),
