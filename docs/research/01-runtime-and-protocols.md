@@ -154,6 +154,26 @@ claude.exe
 
 ---
 
+#### Verified against `claude 2.1.330` (spike X2, 2026-11-24)
+
+Recorded and replayed by `crates/gantry-providers` (fixtures in `tests/fixtures/claude/`). Corrections and additions to the above:
+
+| Topic | Observed behavior |
+| :--- | :--- |
+| Permission modes | CLI choices are `manual` (reported back as `default`), `acceptEdits`, `plan`, `auto`, `dontAsk`, `bypassPermissions`. New `--permission-prompts host\|none` (default `host`). |
+| `initialize` response | Returns `commands`, `agents`, `models`, `account`, `pid`, `claude_code_version`, `current_permission_mode`, `capabilities`, … — **contains account details**: never forward it raw. |
+| `system:init` | Arrives only after the first user message (not at spawn), so "worker ready" comes from the `initialize` response. Lists the user's tools/skills/plugins/MCP servers. |
+| `can_use_tool` | Also carries `display_name`, `description`, `tool_use_id`, `decision_reason(_type)`, `permission_suggestions` (e.g. `setMode acceptEdits`, `addRules … localSettings`); `AskUserQuestion` adds `requires_user_interaction: true`. Commands allowed by the user's settings never prompt. |
+| `AskUserQuestion` answers | `updatedInput: {...input, answers: { "<question text>": "<label>" }}`. |
+| Plan mode | `ExitPlanMode` arrives as `can_use_tool` with `{plan, planFilePath}`; plan files go to `~/.claude/plans` without prompting. |
+| `interrupt` | Replies `{still_queued: []}`, then a `result` (`error_during_execution`, `is_error: true`). A pending approval is withdrawn first with `{"type":"control_cancel_request","request_id":…}`. The worker stays usable for the next turn. |
+| Deny | `{behavior:"deny", message}` becomes an error `tool_result`; the turn continues normally. |
+| `set_model` / `set_permission_mode` | Reply `{model: "<resolved id>"}` / `{mode}`; aliases resolve (`sonnet` → `claude-sonnet-5-5`). |
+| Unsupported control request | Claude itself answers `{subtype:"error", error, error_code:"unsupported_request"}`; Gantry mirrors this for requests it can't serve (`hook_callback`, …). |
+| Mid-turn user message | Not folded into the running turn → Gantry queues prompts until `TurnCompleted` (or interrupts first). |
+| `--resume <id> --fork-session` from a **different cwd** | Works: history is kept and a new session id is issued (retires the Phase 2 "re-home" risk for Claude). |
+| Other stdout frames | `rate_limit_event`, `system:status`, `system:thinking_tokens`, `system:task_started` / `task_notification` (background tasks). |
+
 ### 2.2 Provider 2: OpenAI Codex (`codex.exe app-server` v2 JSON-RPC 2.0)
 
 **Primary Sources:**

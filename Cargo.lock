@@ -1215,6 +1215,14 @@ version = "0.1.0"
 [[package]]
 name = "gantry-providers"
 version = "0.1.0"
+dependencies = [
+ "gantry-proc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "gantry-stage"

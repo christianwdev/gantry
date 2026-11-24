@@ -1,5 +1,6 @@
 [package]
 name = "gantry-providers"
+description = "Agent provider adapters (Claude Code stream-json, Codex app-server, ACP) behind one event model."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,6 +8,15 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+gantry-proc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "io-util", "macros", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

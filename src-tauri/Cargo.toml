@@ -21,7 +21,7 @@ tauri-build = { version = "2.7.6", features = [] }
 
 [dependencies]
 gantry-proc.workspace = true
-serde = { version = "1.0.229", features = ["derive"] }
+serde.workspace = true
 specta = { version = "=2.0.0-rc.28", features = ["derive"] }
 specta-typescript = "=0.0.15"
 tauri = { version = "2.12.7", features = ["specta"] }
