@@ -436,6 +436,35 @@ async fn environment_and_exit_codes() {
     assert_eq!(child.wait().await.unwrap().code(), 42);
 }
 
+/// The exit watcher notices the process exiting even while a descendant keeps its stdout pipe
+/// open (stdout EOF alone would never come).
+#[tokio::test(flavor = "multi_thread")]
+async fn exit_watcher_fires_while_a_descendant_holds_stdout() {
+    let mut child = ManagedCommand::new(FIXTURE)
+        .arg("echo-with-helper") // the helper inherits stdout and outlives the main process
+        .stdin(Stdio::Piped)
+        .stdout(Stdio::Piped)
+        .spawn()
+        .unwrap();
+    let exited = child.exit_watcher().unwrap();
+    let mut out = LineReader::new(child.stdout.take().unwrap(), DEFAULT_MAX_LINE);
+    assert!(
+        matches!(out.next_line().await.unwrap(), Some(Line::Text(t)) if t.starts_with("helper:"))
+    );
+    child.close_stdin(); // main process exits on EOF; the helper keeps running
+    tokio::time::timeout(Duration::from_secs(5), exited)
+        .await
+        .expect("exit watcher fired")
+        .unwrap();
+    // stdout is still open (the helper holds it): EOF hasn't come.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), out.next_line())
+            .await
+            .is_err()
+    );
+    drop(child); // kills the helper via the job
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn direct_child_has_no_console_window() {
     let out = output_of(ManagedCommand::new(FIXTURE).arg("console")).await;

@@ -13,6 +13,11 @@ use std::io::{BufRead, Write};
 use serde_json::Value;
 
 fn main() {
+    // Helper mode (see the `orphan_stdout` directive): just hold the inherited stdout open.
+    if std::env::var_os("FAKE_CLAUDE_HOLD_STDOUT").is_some() {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        return;
+    }
     let path = std::env::var("FAKE_CLAUDE_FIXTURE").expect("FAKE_CLAUDE_FIXTURE is set");
     let fixture = std::fs::read_to_string(&path).expect("fixture readable");
     let stdin = std::io::stdin();
@@ -49,6 +54,11 @@ fn main() {
                     ids.insert(rec.to_owned(), act.to_owned());
                 }
             }
+            Some("out") if record.get("raw").is_some() => {
+                // A non-JSON stdout line, replayed verbatim.
+                writeln!(out, "{}", record["raw"].as_str().unwrap_or("")).unwrap();
+                out.flush().unwrap();
+            }
             Some("out") => {
                 // Only control responses answer Gantry's requests (indexing others mutably
                 // would insert keys into them).
@@ -70,6 +80,20 @@ fn main() {
             // ...or a diagnostic on stderr (e.g. a crash message).
             Some("stderr") => {
                 eprintln!("{}", record["text"].as_str().unwrap_or(""));
+            }
+            // Start a descendant that inherits (and keeps open) this process's stdout, like a
+            // background helper would.
+            Some("orphan_stdout") => {
+                #[allow(
+                    clippy::disallowed_methods,
+                    clippy::disallowed_types,
+                    clippy::zombie_processes
+                )]
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .env("FAKE_CLAUDE_HOLD_STDOUT", "1")
+                    .stdin(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn stdout holder");
             }
             _ => {}
         }

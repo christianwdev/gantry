@@ -154,6 +154,13 @@ pub async fn ask_question(h: &Harness) {
         .find(|o| o.label.to_lowercase().contains("blue"))
         .map(|o| o.label.clone())
         .unwrap_or_else(|| "Blue".into());
+    // ...nor answered with nothing.
+    assert!(matches!(
+        session
+            .answer_questions(&id, std::iter::empty::<(String, String)>())
+            .await,
+        Err(SessionError::IncompleteAnswers(_))
+    ));
     // A question card can't be "approved" without answers.
     assert!(matches!(
         session
@@ -485,6 +492,39 @@ pub async fn shutdown_busy_worker(h: &Harness) {
         "the last stderr line must arrive before SessionTerminated"
     );
     assert!(matches!(session.shutdown().await, Ok(None)));
+}
+
+/// Replay-only: Claude dies while a descendant it started still holds its stdout open. The
+/// session must still end promptly (process watched directly, not just stdout EOF).
+pub async fn crash_with_inherited_stdout(h: &Harness) {
+    let cwd = h.workdir("a");
+    let (session, mut events) = h.spawn("main", &cwd).await;
+    session.send_prompt("work").await.unwrap();
+    let t = std::time::Instant::now();
+    assert_eq!(events.turn_completed().await.0, TurnStatus::Crashed);
+    events.terminated().await;
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(8),
+        "session must end despite the held pipe ({:?})",
+        t.elapsed()
+    );
+    assert!(matches!(session.shutdown().await, Ok(None)));
+}
+
+/// Replay-only: shutdown of a busy worker whose interrupt Claude *rejects* is still an
+/// interrupt the user asked for (not Crashed).
+pub async fn shutdown_rejected_interrupt(h: &Harness) {
+    let cwd = h.workdir("a");
+    let (session, mut events) = h.spawn("main", &cwd).await;
+    session.send_prompt("work").await.unwrap();
+    events
+        .until("ToolStarted", |e| {
+            matches!(e, ProviderEvent::ToolStarted { .. })
+        })
+        .await;
+    let _ = session.shutdown().await.expect("shutdown");
+    assert_eq!(events.turn_completed().await.0, TurnStatus::Interrupted);
+    events.terminated().await;
 }
 
 /// "Deny and stop": the turn ends as an interrupt the user asked for, not a failure.

@@ -15,7 +15,13 @@ pub type TurnId = String;
 pub type InteractionId = String;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+// Tags snake_case (`turn_completed`), fields camelCase (`turnId`) — one casing for every field,
+// including the nested structs, so generated TS bindings are consistent.
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ProviderEvent {
     /// The agent process finished its handshake and accepts prompts.
     Initialized {
@@ -178,4 +184,43 @@ pub enum TurnStatus {
     Failed,
     /// The agent process died mid-turn.
     Crashed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One casing on the wire: snake_case tags, camelCase fields (nested structs included).
+    #[test]
+    fn serialized_events_use_camel_case_fields() {
+        let e = ProviderEvent::TurnCompleted {
+            turn_id: "turn-1".into(),
+            status: TurnStatus::Completed,
+            result: None,
+            usage: None,
+            cost_usd: Some(0.1),
+            error: None,
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["type"], "turn_completed");
+        assert_eq!(v["turnId"], "turn-1");
+        assert_eq!(v["costUsd"], 0.1);
+        assert!(v.get("turn_id").is_none());
+
+        let q = ProviderEvent::QuestionsRequested {
+            turn_id: "t".into(),
+            interaction_id: "i".into(),
+            tool_call_id: None,
+            questions: vec![Question {
+                id: "q".into(),
+                question: "q".into(),
+                header: None,
+                multi_select: true,
+                options: vec![],
+            }],
+        };
+        let v = serde_json::to_value(&q).unwrap();
+        assert_eq!(v["interactionId"], "i");
+        assert_eq!(v["questions"][0]["multiSelect"], true);
+    }
 }

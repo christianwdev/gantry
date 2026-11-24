@@ -28,6 +28,8 @@ replay!(
     exit_during_control,
     late_control_reply,
     shutdown_busy_worker,
+    crash_with_inherited_stdout,
+    shutdown_rejected_interrupt,
     deny_and_stop,
     dismiss_question,
 );

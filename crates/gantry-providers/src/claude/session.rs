@@ -27,6 +27,9 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Shutdown: interrupt a running turn, close stdin (EOF is the stream-json stop), then kill the
 /// tree if the worker has not exited after this long.
 const SHUTDOWN_KILL_AFTER: Duration = Duration::from_secs(5);
+/// After the process exits, how long stdout may keep delivering frames before the session
+/// ends anyway (a descendant may hold the pipe open).
+const STDOUT_DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
 /// Consecutive stdout read errors after which the stream is treated as closed.
 const MAX_CONSECUTIVE_READ_ERRORS: u32 = 8;
 
@@ -51,6 +54,10 @@ pub enum SessionError {
     },
     #[error("claude did not answer `{request}` within {}s", CONTROL_TIMEOUT.as_secs())]
     Timeout { request: &'static str },
+    #[error("stopping claude failed: {0}")]
+    Shutdown(gantry_proc::Error),
+    #[error("answers must cover every question; missing: {0:?}")]
+    IncompleteAnswers(Vec<String>),
     #[error("the claude process has exited")]
     Exited,
 }
@@ -110,6 +117,14 @@ impl Shared {
         let mut file = log.lock().unwrap_or_else(|p| p.into_inner());
         let _ = writeln!(file, "{}", json!({ "dir": dir, "frame": frame }));
     }
+
+    /// A line that isn't JSON (e.g. a warning banner on stdout).
+    fn log_raw(&self, dir: &str, text: &str) {
+        if let Some(log) = &self.raw_log {
+            let mut file = log.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = writeln!(file, "{}", json!({ "dir": dir, "raw": text }));
+        }
+    }
 }
 
 /// If a control request's waiter goes away (timeout / cancelled future) before Claude answered,
@@ -126,6 +141,49 @@ impl Drop for PendingControl<'_> {
         if state.pending_controls.remove(&self.id).is_some() && !state.exited {
             state.late_controls.insert(self.id.clone(), self.request);
         }
+    }
+}
+
+/// Undoes an optimistic state change if the frame never reached Claude — including when the
+/// sending future is cancelled mid-write (e.g. a caller's timeout while the stdin queue is
+/// full): a started turn is aborted, a resolved interaction gets a corrective `Cancelled`.
+struct Undeliverable<'a> {
+    shared: &'a Shared,
+    undo: Undo,
+    delivered: bool,
+}
+
+enum Undo {
+    Turn(TurnId),
+    Answer {
+        turn_id: TurnId,
+        interaction_id: String,
+        clear_interrupt: bool,
+    },
+}
+
+impl Drop for Undeliverable<'_> {
+    fn drop(&mut self) {
+        if self.delivered {
+            return;
+        }
+        let mut state = self.shared.lock();
+        let events = match &self.undo {
+            Undo::Turn(turn_id) => state
+                .normalizer
+                .abort_turn(turn_id, "the prompt could not be delivered to claude"),
+            Undo::Answer {
+                turn_id,
+                interaction_id,
+                clear_interrupt,
+            } => {
+                if *clear_interrupt {
+                    state.normalizer.clear_interrupt_requested(turn_id);
+                }
+                undelivered(turn_id, interaction_id)
+            }
+        };
+        state.emit(events);
     }
 }
 
@@ -287,15 +345,15 @@ impl ClaudeSession {
             let frame = wire::user_message(content, &state.native_session_id);
             (turn_id, frame)
         };
-        if let Err(e) = self.write(&frame).await {
-            // Claude never received it: don't leave a phantom turn open.
-            let mut state = self.shared.lock();
-            let events = state
-                .normalizer
-                .abort_turn(&turn_id, "the prompt could not be delivered to claude");
-            state.emit(events);
-            return Err(e);
-        }
+        // If the write fails or this future is cancelled first, Claude never got the prompt:
+        // don't leave a phantom turn open.
+        let mut guard = Undeliverable {
+            shared: &self.shared,
+            undo: Undo::Turn(turn_id.clone()),
+            delivered: false,
+        };
+        self.write(&frame).await?;
+        guard.delivered = true;
         Ok(turn_id)
     }
 
@@ -375,15 +433,18 @@ impl ClaudeSession {
             state.emit(events);
             (frame, turn_id)
         };
-        let written = self.write(&frame).await;
-        if written.is_err() {
-            let mut state = self.shared.lock();
-            if stops_turn {
-                state.normalizer.clear_interrupt_requested(&turn_id);
-            }
-            state.emit(undelivered(&turn_id, interaction_id));
-        }
-        written
+        let mut guard = Undeliverable {
+            shared: &self.shared,
+            undo: Undo::Answer {
+                turn_id,
+                interaction_id: interaction_id.to_owned(),
+                clear_interrupt: stops_turn,
+            },
+            delivered: false,
+        };
+        self.write(&frame).await?;
+        guard.delivered = true;
+        Ok(())
     }
 
     /// Answers an `AskUserQuestion` card. `answers` maps question id (the question text for
@@ -407,6 +468,21 @@ impl ClaudeSession {
             if pending.tool_name != ASK_USER_QUESTION {
                 return Err(SessionError::NotAQuestion(interaction_id.to_owned()));
             }
+            // Every question needs an answer: an empty/partial set is the same "allow without
+            // answers" that respond_approval refuses (dismiss with Deny instead).
+            let missing: Vec<String> = pending
+                .input
+                .get("questions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|q| q.get("question").and_then(Value::as_str))
+                .filter(|q| !answers.contains_key(*q))
+                .map(str::to_owned)
+                .collect();
+            if !missing.is_empty() || answers.is_empty() {
+                return Err(SessionError::IncompleteAnswers(missing));
+            }
             let mut input = pending.input;
             let Some(obj) = input.as_object_mut() else {
                 // Never send an "allow" that silently drops the user's answers.
@@ -422,13 +498,18 @@ impl ClaudeSession {
             (wire::allow(interaction_id, input, &[]), pending.turn_id)
         };
         let (frame, turn_id) = frame;
-        let written = self.write(&frame).await;
-        if written.is_err() {
-            self.shared
-                .lock()
-                .emit(undelivered(&turn_id, interaction_id));
-        }
-        written
+        let mut guard = Undeliverable {
+            shared: &self.shared,
+            undo: Undo::Answer {
+                turn_id,
+                interaction_id: interaction_id.to_owned(),
+                clear_interrupt: false,
+            },
+            delivered: false,
+        };
+        self.write(&frame).await?;
+        guard.delivered = true;
+        Ok(())
     }
 
     /// Switches the model live. Returns the model Claude resolved (e.g. `sonnet` → full id).
@@ -477,6 +558,9 @@ impl ClaudeSession {
             // process exits before Claude reports a result.
             self.shared.lock().normalizer.note_interrupt_requested();
             let _ = tokio::time::timeout(Duration::from_secs(2), self.interrupt()).await;
+            // Re-assert: a *rejected* interrupt clears the flag, but this turn still ends
+            // because the user shut the session down.
+            self.shared.lock().normalizer.note_interrupt_requested();
         }
         let (reply, rx) = oneshot::channel();
         if self
@@ -488,7 +572,7 @@ impl ClaudeSession {
             return Ok(None);
         }
         match rx.await {
-            Ok(outcome) => outcome.map(Some).map_err(SessionError::Spawn),
+            Ok(outcome) => outcome.map(Some).map_err(SessionError::Shutdown),
             // The actor ended (process gone) before running the ladder.
             Err(_) => Ok(None),
         }
@@ -514,14 +598,24 @@ impl ClaudeSession {
             id: id.clone(),
             request,
         };
-        self.write(&wire::control_request(&id, body)).await?;
-        match tokio::time::timeout(CONTROL_TIMEOUT, rx).await {
-            Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(message))) => Err(SessionError::Rejected { request, message }),
-            // Sender dropped: the process exited before answering.
-            Ok(Err(_)) => Err(SessionError::Exited),
-            Err(_) => Err(SessionError::Timeout { request }),
-        }
+        // The timeout covers the write too: a full stdin queue (Claude not reading) must not
+        // hang a control request past its deadline.
+        let exchange = async {
+            if let Err(e) = self.write(&wire::control_request(&id, body)).await {
+                // Never sent, so never answered: don't file it as a late request.
+                self.shared.lock().pending_controls.remove(&id);
+                return Err(e);
+            }
+            match rx.await {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(message)) => Err(SessionError::Rejected { request, message }),
+                // Sender dropped: the process exited before answering.
+                Err(_) => Err(SessionError::Exited),
+            }
+        };
+        tokio::time::timeout(CONTROL_TIMEOUT, exchange)
+            .await
+            .unwrap_or(Err(SessionError::Timeout { request }))
     }
 
     async fn write(&self, frame: &Value) -> Result<()> {
@@ -587,6 +681,23 @@ async fn run(
         }
     });
 
+    // Watch the process itself, not just stdout: a descendant that inherited Claude's stdout
+    // would otherwise keep the pipe open after Claude dies and the session would never end.
+    let exited = child.exit_watcher();
+    let exit_watch = async move {
+        match exited {
+            Ok(fut) => {
+                let _ = fut.await;
+            }
+            // Couldn't duplicate the handle: rely on stdout EOF alone.
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(exit_watch);
+    let mut process_gone = false;
+    let drain_deadline = tokio::time::sleep(Duration::MAX);
+    tokio::pin!(drain_deadline);
+
     let mut child = Some(child);
     let mut ladder_reply: Option<oneshot::Sender<gantry_proc::Result<Shutdown>>> = None;
     let (ladder_tx, mut ladder_rx) =
@@ -595,6 +706,15 @@ async fn run(
     let mut end_reason = "agent process exited".to_owned();
     loop {
         tokio::select! {
+            () = &mut exit_watch, if !process_gone => {
+                // Give stdout a moment to deliver Claude's final frames, then stop waiting for
+                // an EOF a descendant may be holding back.
+                process_gone = true;
+                drain_deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + STDOUT_DRAIN_AFTER_EXIT);
+            }
+            () = &mut drain_deadline, if process_gone => break,
             read = lines.recv() => match read {
                 Some(Read::Line(Line::Text(text))) => handle_line(&shared, &writer, &text).await,
                 Some(Read::Line(Line::Oversized { len })) => {
@@ -694,6 +814,8 @@ async fn handle_line(shared: &Shared, writer: &StdinWriter, text: &str) {
     let frame: Value = match serde_json::from_str(text) {
         Ok(frame) => frame,
         Err(_) => {
+            // Logged too, so recordings/diagnostics match what the stream saw.
+            shared.log_raw("out", text);
             shared.lock().emit(vec![ProviderEvent::Other {
                 kind: "non_json_output".into(),
                 frame: Value::String(text.to_owned()),
@@ -748,7 +870,12 @@ async fn handle_line(shared: &Shared, writer: &StdinWriter, text: &str) {
                         &format!("Gantry does not support control request `{subtype}`"),
                     );
                     shared.log_frame("in", &reply);
-                    let _ = writer.send_line(&reply.to_string()).await;
+                    // From its own task: the actor must never block on a full stdin queue, or
+                    // it stops draining stdout and the two processes can deadlock.
+                    let writer = writer.clone();
+                    tokio::spawn(async move {
+                        let _ = writer.send_line(&reply.to_string()).await;
+                    });
                 }
             }
         }

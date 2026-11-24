@@ -644,6 +644,16 @@ impl ManagedChild {
             .expect("process handle signaled, so the process has exited"))
     }
 
+    /// A future that resolves when this process exits, independent of `&mut self`: it owns a
+    /// duplicated process handle, so it can be awaited while the child itself is moved or used
+    /// elsewhere (e.g. to notice a crash even if a descendant keeps the stdout pipe open).
+    pub fn exit_watcher(
+        &self,
+    ) -> Result<impl std::future::Future<Output = Result<()>> + Send + 'static> {
+        let handle = self.process.try_clone()?;
+        Ok(async move { wait_for_handle(handle.as_handle()).await })
+    }
+
     /// Waits up to `timeout` for the process to exit.
     pub async fn wait_timeout(&mut self, timeout: Duration) -> Result<Option<ExitStatus>> {
         match tokio::time::timeout(timeout, self.wait()).await {
