@@ -12,6 +12,8 @@ use specta::Type;
 use tokio::io::AsyncReadExt;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long to keep reading stdout after the probed process has exited.
+const READ_GRACE: Duration = Duration::from_secs(2);
 
 /// CLIs probed on startup: (display name, program, version args).
 const TOOLS: &[(&str, &str, &[&str])] = &[
@@ -60,10 +62,15 @@ pub async fn probe_all() -> Vec<ToolStatus> {
         tauri::async_runtime::spawn(async move { probe(name, program, args).await })
     });
     let mut out = Vec::with_capacity(TOOLS.len());
-    for handle in probes.collect::<Vec<_>>() {
-        if let Ok(status) = handle.await {
-            out.push(status);
-        }
+    for (handle, &(name, program, _)) in probes.collect::<Vec<_>>().into_iter().zip(TOOLS) {
+        out.push(handle.await.unwrap_or_else(|e| ToolStatus {
+            name: name.to_owned(),
+            program: program.to_owned(),
+            state: ToolState::Failed,
+            path: None,
+            version: None,
+            error: Some(format!("probe task failed: {e}")),
+        }));
     }
     out
 }
@@ -100,11 +107,25 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
 
     let run = async {
         let mut child = cmd.spawn()?;
-        let mut out = Vec::new();
-        if let Some(stdout) = child.stdout.as_mut() {
-            stdout.read_to_end(&mut out).await?;
-        }
+        // Drain stdout concurrently (so a full pipe can't stall the child), but finish on the
+        // process exiting, not on EOF: a helper that inherited stdout would hold it open.
+        let mut stdout = child.stdout.take();
+        let reader = tokio::spawn(async move {
+            let mut out = Vec::new();
+            if let Some(stdout) = stdout.as_mut() {
+                let _ = stdout.read_to_end(&mut out).await;
+            }
+            out
+        });
         let exit = child.wait().await?;
+        // A --version probe needs no survivors; killing them closes the pipe so the reader
+        // gets everything already written, then EOF.
+        let _ = child.kill_tree();
+        let out = tokio::time::timeout(READ_GRACE, reader)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
         Ok::<_, gantry_proc::Error>((exit, String::from_utf8_lossy(&out).into_owned()))
     };
     match tokio::time::timeout(PROBE_TIMEOUT, run).await {
@@ -129,6 +150,22 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    /// Review fix: a CLI that prints its version and exits while a helper it spawned keeps
+    /// stdout open must not be reported as "timed out".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_finishes_on_exit_even_if_a_helper_holds_stdout() {
+        let script = "require('child_process').spawn(process.execPath, \
+            ['-e', 'setTimeout(() => {}, 30000)'], { stdio: ['ignore', 'inherit', 'ignore'] }).unref(); \
+            console.log('v9.9.9');";
+        let t = Instant::now();
+        let status = super::probe("Helper", "node", &["-e", script]).await;
+        assert_eq!(status.state, super::ToolState::Ok, "{status:?}");
+        assert_eq!(status.version.as_deref(), Some("v9.9.9"));
+        assert!(t.elapsed() < super::PROBE_TIMEOUT / 2, "{:?}", t.elapsed());
+    }
+
     /// Runs the real probes. Git is a hard prerequisite of Gantry (worktrees, diffs), so it
     /// must resolve and report a version; the agent CLIs are optional on dev machines.
     #[tokio::test(flavor = "multi_thread")]

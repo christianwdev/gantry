@@ -13,6 +13,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
@@ -67,17 +68,19 @@ pub fn merge_path_lists(lists: &[OsString]) -> OsString {
     joined
 }
 
+/// Splits a `;`-separated path list, trimming whitespace and surrounding quotes on the raw
+/// UTF-16 so entries containing unpaired surrogates survive intact.
 fn split_path_list(list: &OsStr) -> impl Iterator<Item = OsString> + '_ {
     let wide: Vec<u16> = list.encode_wide().collect();
+    let is_trim = |c: &u16| matches!(*c, 0x20 | 0x09 | 0x0A | 0x0D | 0x22);
     wide.split(|&c| c == b';' as u16)
         .map(|part| {
-            let s = OsString::from_wide(part);
-            let trimmed = s.to_string_lossy().trim().trim_matches('"').to_owned();
-            if trimmed.len() == s.len() {
-                s
-            } else {
-                OsString::from(trimmed)
-            }
+            let start = part.iter().position(|c| !is_trim(c)).unwrap_or(part.len());
+            let end = part
+                .iter()
+                .rposition(|c| !is_trim(c))
+                .map_or(start, |i| i + 1);
+            OsString::from_wide(&part[start..end])
         })
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
@@ -88,41 +91,32 @@ fn registry_path(root: HKEY, subkey: &str) -> Option<OsString> {
     let subkey = wide_nul(OsStr::new(subkey));
     let value = wide_nul(OsStr::new("Path"));
     let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
-    let mut size: u32 = 0;
-    // SAFETY: valid NUL-terminated strings; a null data pointer queries the required size.
-    let rc = unsafe {
-        RegGetValueW(
-            root,
-            subkey.as_ptr(),
-            value.as_ptr(),
-            flags,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut size,
-        )
-    };
-    if rc != 0 || size == 0 {
-        return None;
+    let mut buf: Vec<u16> = vec![0; 2048];
+    // Retry on ERROR_MORE_DATA: the value can grow between calls (an installer editing PATH).
+    for _ in 0..8 {
+        let mut size_bytes = (buf.len() * 2) as u32;
+        // SAFETY: valid NUL-terminated strings; `buf` is writable for `size_bytes` bytes.
+        let rc = unsafe {
+            RegGetValueW(
+                root,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                flags,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut size_bytes,
+            )
+        };
+        match rc {
+            0 => {
+                let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                return Some(expand_env(&buf[..len]));
+            }
+            ERROR_MORE_DATA => buf = vec![0; (size_bytes as usize).div_ceil(2) + 64],
+            _ => return None,
+        }
     }
-    let mut buf: Vec<u16> = vec![0; (size as usize).div_ceil(2) + 1];
-    let mut size_bytes = (buf.len() * 2) as u32;
-    // SAFETY: `buf` is writable for `size_bytes` bytes.
-    let rc = unsafe {
-        RegGetValueW(
-            root,
-            subkey.as_ptr(),
-            value.as_ptr(),
-            flags,
-            std::ptr::null_mut(),
-            buf.as_mut_ptr().cast(),
-            &mut size_bytes,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    Some(expand_env(&buf[..len]))
+    None
 }
 
 fn expand_env(raw: &[u16]) -> OsString {
@@ -152,8 +146,10 @@ pub(crate) fn wide_nul(s: &OsStr) -> Vec<u16> {
 ///
 /// * Paths (containing a separator or drive) are resolved against `cwd` and must point at an
 ///   executable; an extension-less path tries `.exe`.
-/// * Bare names are searched only in `search_path` (never the current directory). A bare name
-///   without an extension tries `.exe` then `.com` in each directory.
+/// * Bare names are searched only in the absolute directories of `search_path` (never the
+///   current directory, and relative PATH entries are skipped). A bare name without an
+///   extension tries `.exe` then `.com` in each directory. Script extensions (`.cmd`, `.bat`,
+///   `.ps1`, `.vbs`) are always refused.
 pub fn find_executable(
     program: &OsStr,
     search_path: &OsStr,
@@ -170,20 +166,26 @@ pub fn find_executable(
     }
 
     let ext = extension_lower(as_path);
+    if ext.as_deref().is_some_and(|e| SHIM_EXTS.contains(&e)) {
+        // Refused regardless of PATH or existence: Gantry never launches scripts.
+        return Err(Error::UnsupportedExecutable {
+            path: as_path.to_path_buf(),
+        });
+    }
     let mut shim: Option<PathBuf> = None;
     for dir in split_path_list(search_path) {
         let dir = PathBuf::from(dir);
+        // Relative entries (".", "bin") would resolve against Gantry's own cwd, which is
+        // neither intended nor safe (a planted git.exe); Windows' loader has the same flaw.
+        if !dir.is_absolute() {
+            continue;
+        }
         match ext.as_deref() {
             Some(e) if EXECUTABLE_EXTS.contains(&e) => {
                 let candidate = dir.join(as_path);
                 if is_file(&candidate) {
                     return Ok(dunce::simplified(&candidate).to_path_buf());
                 }
-            }
-            Some(e) if SHIM_EXTS.contains(&e) => {
-                return Err(Error::UnsupportedExecutable {
-                    path: as_path.to_path_buf(),
-                });
             }
             _ => {
                 for e in EXECUTABLE_EXTS {
@@ -305,6 +307,47 @@ mod tests {
             "{err:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn script_extensions_are_refused_even_with_empty_path() {
+        for path in [OsStr::new(""), OsStr::new(r"C:\Windows\System32")] {
+            let err = find_executable(OsStr::new("typo.cmd"), path, None).unwrap_err();
+            assert!(
+                matches!(err, Error::UnsupportedExecutable { .. }),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_path_entries_are_skipped() {
+        // Plant an exe in a directory reachable via a *relative* PATH entry from the test's
+        // cwd (no set_current_dir: tests run in parallel threads of one process).
+        let rel = format!("target-rel-path-test-{}", std::process::id());
+        let dir = std::env::current_dir().unwrap().join(&rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(system32().join("cmd.exe"), dir.join("planted.exe")).unwrap();
+        let res = find_executable(OsStr::new("planted"), OsStr::new(&format!(".;{rel}")), None);
+        // Control: the same directory as an absolute entry is found.
+        let abs = find_executable(OsStr::new("planted"), dir.as_os_str(), None);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(matches!(res, Err(Error::NotFound { .. })), "{res:?}");
+        assert!(abs.is_ok(), "{abs:?}");
+    }
+
+    #[test]
+    fn split_trims_on_utf16_and_keeps_lone_surrogates() {
+        let mut raw: Vec<u16> = r#" "C:\x"#.encode_utf16().collect();
+        raw.push(0xD800); // unpaired surrogate
+        raw.extend(r#"" ;C:\y"#.encode_utf16());
+        let parts: Vec<OsString> = split_path_list(&OsString::from_wide(&raw)).collect();
+        let mut expected: Vec<u16> = r"C:\x".encode_utf16().collect();
+        expected.push(0xD800);
+        assert_eq!(
+            parts,
+            vec![OsString::from_wide(&expected), OsString::from(r"C:\y")]
+        );
     }
 
     #[test]

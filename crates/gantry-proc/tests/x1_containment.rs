@@ -24,10 +24,11 @@ use windows_sys::Win32::System::Threading::{
 const FIXTURE: &str = env!("CARGO_BIN_EXE_gantry-proc-fixture");
 
 fn scratch_dir(name: &str) -> PathBuf {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join("gantry-proc-tests").join(format!(
         "{name}-{}-{}",
         std::process::id(),
-        Instant::now().elapsed().as_nanos()
+        SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();

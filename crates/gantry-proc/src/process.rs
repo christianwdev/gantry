@@ -97,7 +97,9 @@ impl ManagedCommand {
         self
     }
 
-    /// Starts from an empty environment instead of Gantry's own.
+    /// Starts from an empty environment instead of Gantry's own. A bare program name is then
+    /// resolved on Gantry's PATH unless you set `PATH`. Most Windows programs also need
+    /// `SystemRoot` (Winsock, crypto), so pass it through explicitly if the child needs it.
     pub fn env_clear(&mut self) -> &mut Self {
         self.env_clear = true;
         self.env_ops.clear();
@@ -135,11 +137,7 @@ impl ManagedCommand {
     /// The resolved executable path this command would launch.
     pub fn resolve_program(&self) -> Result<PathBuf> {
         let env = self.build_env();
-        let path = env
-            .get(OsStr::new("PATH"))
-            .map(OsStr::to_owned)
-            .unwrap_or_default();
-        find_executable(&self.program, &path, self.cwd.as_deref())
+        find_executable(&self.program, &search_path(&env), self.cwd.as_deref())
     }
 
     fn build_env(&self) -> EnvMap {
@@ -166,11 +164,7 @@ impl ManagedCommand {
     /// Must be called within a Tokio runtime when any stream is [`Stdio::Piped`].
     pub fn spawn(&self) -> Result<ManagedChild> {
         let env = self.build_env();
-        let search_path = env
-            .get(OsStr::new("PATH"))
-            .map(OsStr::to_owned)
-            .unwrap_or_default();
-        let program = find_executable(&self.program, &search_path, self.cwd.as_deref())?;
+        let program = find_executable(&self.program, &search_path(&env), self.cwd.as_deref())?;
         let mut cmdline = command_line(&program, &self.args)?;
         let app_name = wide_nul(program.as_os_str());
         let env_block = env.to_block()?;
@@ -284,6 +278,15 @@ impl ManagedCommand {
     }
 }
 
+/// The PATH used to resolve the program: the child's own, or Gantry's merged PATH when
+/// the child's environment has none (e.g. after `env_clear`), matching Rust std's fallback.
+fn search_path(env: &EnvMap) -> OsString {
+    match env.get(OsStr::new("PATH")) {
+        Some(path) => path.to_owned(),
+        None => merged_path(),
+    }
+}
+
 fn stdio_end(cfg: Stdio, direction: Direction) -> Result<(Option<NamedPipeServer>, OwnedHandle)> {
     match cfg {
         Stdio::Null => Ok((None, null_handle(direction)?)),
@@ -296,7 +299,12 @@ fn stdio_end(cfg: Stdio, direction: Direction) -> Result<(Option<NamedPipeServer
 
 /// An initialized `PROC_THREAD_ATTRIBUTE_LIST` carrying the handle list and job list.
 struct AttributeList<'a> {
-    buf: Vec<usize>,
+    /// Backing storage; never touched again after `ptr` is derived from it (moving the Vec
+    /// does not move its heap buffer).
+    _buf: Vec<usize>,
+    /// Derived via `as_mut_ptr`, since Win32 writes through it.
+    ptr: LPPROC_THREAD_ATTRIBUTE_LIST,
+    initialized: bool,
     _borrows: std::marker::PhantomData<&'a [HANDLE]>,
 }
 
@@ -309,21 +317,23 @@ impl<'a> AttributeList<'a> {
         if size == 0 {
             return Err(Error::last_os("InitializeProcThreadAttributeList"));
         }
+        let mut buf = vec![0usize; size.div_ceil(size_of::<usize>())];
+        let ptr = buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
         let mut list = AttributeList {
-            buf: vec![0usize; size.div_ceil(size_of::<usize>())],
+            _buf: buf,
+            ptr,
+            initialized: false,
             _borrows: std::marker::PhantomData,
         };
-        // SAFETY: `buf` is at least `size` bytes and pointer-aligned.
-        if unsafe { InitializeProcThreadAttributeList(list.as_ptr(), 2, 0, &mut size) } == 0 {
-            // Not initialized, so Drop must not call DeleteProcThreadAttributeList.
-            let err = Error::last_os("InitializeProcThreadAttributeList");
-            list.buf = Vec::new();
-            return Err(err);
+        // SAFETY: `ptr` points at least `size` writable, pointer-aligned bytes.
+        if unsafe { InitializeProcThreadAttributeList(list.ptr, 2, 0, &mut size) } == 0 {
+            return Err(Error::last_os("InitializeProcThreadAttributeList"));
         }
+        list.initialized = true;
         // SAFETY: the value arrays are borrowed for 'a, which outlives every use of the list.
         unsafe {
             if UpdateProcThreadAttribute(
-                list.as_ptr(),
+                list.ptr,
                 0,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
                 handles.as_ptr().cast(),
@@ -335,7 +345,7 @@ impl<'a> AttributeList<'a> {
                 return Err(Error::last_os("UpdateProcThreadAttribute(HANDLE_LIST)"));
             }
             if UpdateProcThreadAttribute(
-                list.as_ptr(),
+                list.ptr,
                 0,
                 PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
                 jobs.as_ptr().cast(),
@@ -351,15 +361,15 @@ impl<'a> AttributeList<'a> {
     }
 
     fn as_ptr(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
-        self.buf.as_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST
+        self.ptr
     }
 }
 
 impl Drop for AttributeList<'_> {
     fn drop(&mut self) {
-        if !self.buf.is_empty() {
-            // SAFETY: the list was successfully initialized.
-            unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
+        if self.initialized {
+            // SAFETY: the list was successfully initialized and is deleted exactly once.
+            unsafe { DeleteProcThreadAttributeList(self.ptr) };
         }
     }
 }
