@@ -283,10 +283,62 @@ mod tests {
             LocalFree(sd.cast());
             s
         };
-        let sid = current_user_sid_string().unwrap();
         assert!(sddl.starts_with("D:P("), "{sddl}");
         assert_eq!(sddl.matches("(A;").count(), 1, "{sddl}");
-        assert!(sddl.ends_with(&format!(";;;{sid})")), "{sddl}");
         assert!(!sddl.contains(";WD)") && !sddl.contains(";AN)"), "{sddl}");
+        // SDDL rendering abbreviates well-known SIDs (e.g. the built-in Administrator, as on CI
+        // runners, renders as `LA`), so compare against the current user's SID rendered the
+        // same way rather than against the raw `S-1-5-...` string.
+        let expected = render_dacl(&owner_only_sddl(&current_user_sid_string().unwrap()));
+        assert_eq!(trustee(&sddl), trustee(&expected), "{sddl} vs {expected}");
+    }
+
+    /// Well-known SIDs come back abbreviated, which is why the test above compares rendered
+    /// trustees (CI runs as the built-in Administrator: `LA`).
+    #[test]
+    fn rendered_dacl_abbreviates_well_known_sids() {
+        assert_eq!(trustee(&render_dacl(&owner_only_sddl("S-1-5-18"))), "SY");
+    }
+
+    /// The trustee (last field) of a single-ACE DACL string: `D:P(A;;FA;;;LA)` -> `LA`.
+    fn trustee(sddl: &str) -> &str {
+        let start = sddl.rfind(";;;").expect("ACE") + 3;
+        sddl[start..].trim_end_matches(')')
+    }
+
+    /// Parses `sddl` and renders its DACL back to a string, applying the same abbreviations.
+    fn render_dacl(sddl: &str) -> String {
+        let wide = wide_nul(OsStr::new(sddl));
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: NUL-terminated input; `sd` is LocalAlloc'd and freed below.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0);
+        let mut text: PWSTR = std::ptr::null_mut();
+        // SAFETY: valid descriptor; `text` is LocalAlloc'd and freed below.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0);
+        // SAFETY: NUL-terminated string from the API; both allocations freed exactly once.
+        unsafe {
+            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text.cast());
+            LocalFree(sd.cast());
+            s
+        }
     }
 }
