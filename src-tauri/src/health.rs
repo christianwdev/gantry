@@ -388,12 +388,10 @@ fn version_line(bytes: &[u8], program: &str) -> Option<String> {
 fn looks_like_version(line: &str) -> bool {
     let is_sep = |c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '"' | '\'');
     let lower = line.to_ascii_lowercase();
-    // Whole-word match, so e.g. "description" doesn't count as "ip".
-    let network_context = lower.split(|c: char| !c.is_ascii_alphabetic()).any(|w| {
-        NETWORK_WORDS
-            .iter()
-            .any(|n| w == *n || w.starts_with(n) && *n != "ip")
-    });
+    // Exact whole-word match ("description" is not "ip", "portable" is not "port").
+    let network_context = lower
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|w| NETWORK_WORDS.contains(&w));
     line.split(is_sep)
         .any(|t| is_version_token(t, network_context))
 }
@@ -432,9 +430,25 @@ fn is_version_token(token: &str, network_context: bool) -> bool {
 }
 
 /// Words that make a bare dotted quad on the same line read as an IP address.
+/// Matched as exact whole words only (no prefixes: `portable`, `hosted`, `serverless` must not
+/// count). Deliberately excludes words common in product names (`server`, `port`).
 const NETWORK_WORDS: &[&str] = &[
-    "proxy", "listen", "host", "address", "addr", "ip", "server", "connect", "http", "dns",
-    "gateway", "bind", "socket", "port",
+    "proxy",
+    "listen",
+    "listening",
+    "host",
+    "address",
+    "addr",
+    "ip",
+    "connect",
+    "connecting",
+    "connection",
+    "http",
+    "https",
+    "dns",
+    "gateway",
+    "bind",
+    "socket",
 ];
 
 /// "`x --version` failed: <exit>", plus the CLI's own first line of output (usually the reason,
@@ -535,6 +549,9 @@ mod tests {
             "Antigravity 1.0.0.0",
             "tool v1.2.3.4",
             "description 1.0.0.0",
+            "Antigravity Server 1.0.0.0",
+            "Tool Portable 2.1.0.4",
+            "hosted-runner 1.0.0.0",
         ] {
             assert!(super::looks_like_version(v), "{v}");
         }

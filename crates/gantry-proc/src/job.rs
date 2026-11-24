@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
@@ -11,8 +12,8 @@ use windows_sys::Win32::System::JobObjects::{
 
 use crate::{Error, Result};
 
-/// A Win32 Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and **no** breakaway
-/// permission.
+/// A Win32 Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and
+/// `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`, and **no** breakaway permission.
 ///
 /// Every process created inside the job — and every descendant those processes create, since
 /// breakaway is not allowed — is terminated when the last handle to the job closes. That happens
@@ -41,7 +42,12 @@ impl Job {
         // SAFETY: zero is a valid bit pattern for this plain-old-data struct.
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         // Deliberately NOT setting JOB_OBJECT_LIMIT_BREAKAWAY_OK / SILENT_BREAKAWAY_OK.
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // DIE_ON_UNHANDLED_EXCEPTION: children are headless, so a crash should terminate them
+        // at once instead of parking them in Windows Error Reporting (dump collection or a
+        // dialog) while they still hold files and pipes. Programs with their own crash
+        // handler (e.g. Edge's crashpad) are unaffected: it handles the exception first.
+        info.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
         // SAFETY: `info` is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION of the stated size.
         let ok = unsafe {
             SetInformationJobObject(

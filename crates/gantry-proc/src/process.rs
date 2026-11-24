@@ -407,6 +407,10 @@ impl Drop for AttributeList<'_> {
 pub struct Shutdown {
     /// Exit status of the main process.
     pub status: ExitStatus,
+    /// Whether the ladder had to terminate the main process (step 3), as opposed to it exiting
+    /// on its own after the cancel or EOF. A forced kill exits with code 1, which is otherwise
+    /// indistinguishable from the agent calling `exit(1)` itself.
+    pub forced: bool,
     /// Whether the child's whole job (all descendants) was confirmed empty afterwards. `false`
     /// means leftovers may still hold files or ports open.
     pub tree_empty: bool,
@@ -471,9 +475,12 @@ pub struct StdinWriter {
 impl StdinWriter {
     /// Queues bytes for the child, waiting while the queue is full.
     ///
-    /// Fails with `BrokenPipe` once stdin is closed or the child stopped reading. Any `send`
-    /// that starts after [`ManagedChild::close_stdin`] returned fails; a send racing the close
-    /// itself may be dropped, as with any pipe being closed concurrently.
+    /// Fails with `BrokenPipe` once stdin is closed, the pipe broke (the child exited or closed
+    /// its stdin), or the writer task ended. A child that is alive but simply not reading does
+    /// **not** make this fail: once the queue is full, `send` waits — wrap it in
+    /// `tokio::time::timeout` if the caller must not block. Any `send` that starts after
+    /// [`ManagedChild::close_stdin`] returned fails; a send racing the close itself may be
+    /// dropped, as with any pipe being closed concurrently.
     pub async fn send(&self, bytes: impl Into<Vec<u8>>) -> io::Result<()> {
         let broken = || io::Error::new(io::ErrorKind::BrokenPipe, "child stdin is closed");
         if self.closed.load(AtomicOrdering::Acquire) {
@@ -710,16 +717,20 @@ impl ManagedChild {
                 }
             }
         };
-        result.map(|status| Shutdown { status, tree_empty })
+        result.map(|(status, forced)| Shutdown {
+            status,
+            forced,
+            tree_empty,
+        })
     }
 
     async fn stop_main_process(
         &mut self,
         eof_after: Duration,
         kill_after: Duration,
-    ) -> Result<ExitStatus> {
+    ) -> Result<(ExitStatus, bool)> {
         if let Some(status) = self.wait_timeout(eof_after).await? {
-            return Ok(status);
+            return Ok((status, false));
         }
         tracing::debug!(pid = self.pid, "shutdown ladder: closing stdin");
         self.close_stdin();
@@ -727,7 +738,7 @@ impl ManagedChild {
             .wait_timeout(kill_after.saturating_sub(eof_after))
             .await?
         {
-            return Ok(status);
+            return Ok((status, false));
         }
         tracing::warn!(pid = self.pid, "shutdown ladder: terminating process tree");
         if let Err(tree_err) = self.kill_tree() {
@@ -738,7 +749,7 @@ impl ManagedChild {
         // Bounded: a process stuck in uncancellable kernel I/O (AV/filter driver, hung network
         // redirector) can stay unsignaled after termination; don't hang teardown forever.
         match self.wait_timeout(TERMINATE_WAIT).await? {
-            Some(status) => Ok(status),
+            Some(status) => Ok((status, true)),
             None => Err(Error::NotTerminated { pid: self.pid }),
         }
     }

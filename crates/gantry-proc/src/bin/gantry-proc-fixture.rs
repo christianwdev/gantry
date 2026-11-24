@@ -54,6 +54,12 @@ fn main() {
             out.write_all(&vec![b'b'; n]).unwrap();
             out.write_all(b"\nafter\n").unwrap();
         }
+        // An unhandled access violation (no handler installed), like a crashing native CLI.
+        "crash" => {
+            // SAFETY: deliberately invalid; this fixture exists to crash. Volatile so the
+            // compiler can't elide or reason about the null write.
+            unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u32>(), 1) };
+        }
         "console" => println!(
             "{}",
             if has_console_window() {

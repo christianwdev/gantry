@@ -637,12 +637,12 @@ async fn shutdown_ladder_prefers_eof_then_kills() {
         .spawn()
         .unwrap();
     let t = Instant::now();
-    let status = echo
+    let outcome = echo
         .shutdown(Duration::from_millis(200), Duration::from_secs(5))
         .await
-        .unwrap()
-        .status;
-    assert!(status.success());
+        .unwrap();
+    assert!(outcome.status.success());
+    assert!(!outcome.forced, "a clean EOF exit is not a forced kill");
     assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
 
     // Ignores EOF, so the job is terminated (step 3).
@@ -652,12 +652,12 @@ async fn shutdown_ladder_prefers_eof_then_kills() {
         .spawn()
         .unwrap();
     let t = Instant::now();
-    let status = sleeper
+    let outcome = sleeper
         .shutdown(Duration::from_millis(100), Duration::from_millis(300))
         .await
-        .unwrap()
-        .status;
-    assert_eq!(status.code(), 1);
+        .unwrap();
+    assert_eq!(outcome.status.code(), 1);
+    assert!(outcome.forced, "step 3 must be reported as a forced kill");
     assert!(t.elapsed() >= Duration::from_millis(300));
 }
 
@@ -682,6 +682,19 @@ fn relative_current_dir_is_refused() {
         cmd.resolve_program().unwrap_err(),
         Error::RelativeCurrentDir { .. }
     ));
+}
+
+/// Review fix: a crashing headless child dies immediately with its exception code (the job
+/// sets DIE_ON_UNHANDLED_EXCEPTION) instead of lingering in Windows Error Reporting.
+#[tokio::test(flavor = "multi_thread")]
+async fn crashing_child_dies_promptly_with_its_exception_code() {
+    let mut child = ManagedCommand::new(FIXTURE).arg("crash").spawn().unwrap();
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .await
+        .unwrap()
+        .expect("crashed child should exit promptly");
+    assert_eq!(status.code(), 0xC000_0005, "{status}"); // STATUS_ACCESS_VIOLATION
 }
 
 /// Review fix: piped spawning outside a runtime is an error, not a panic.
