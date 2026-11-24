@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::windows::named_pipe::NamedPipeServer;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc};
 use windows_sys::Win32::Foundation::{
     HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -456,7 +456,7 @@ pub struct ManagedChild {
     /// would otherwise kill the child immediately.
     _group: Option<Arc<Job>>,
     status: Option<ExitStatus>,
-    stdin_close: Option<(oneshot::Sender<()>, Arc<AtomicBool>)>,
+    stdin_close: Option<(Arc<Notify>, Arc<AtomicBool>)>,
     /// Raw stdin. Prefer [`ManagedChild::stdin_writer`]: if you `take()` this, the shutdown
     /// ladder can no longer close stdin for you.
     pub stdin: Option<ChildStdin>,
@@ -533,9 +533,13 @@ impl ManagedChild {
         let mut pipe = self.stdin.take()?;
         // Clamped: tokio panics on huge channel buffers, and frames past ~64k queued are a bug.
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(capacity.clamp(1, MAX_STDIN_QUEUE));
-        let (close_tx, mut close_rx) = oneshot::channel::<()>();
+        // A Notify (not a oneshot): only an explicit close_stdin() signals it. Dropping the
+        // ManagedChild must not close a still-running agent's stdin (its job may live on via a
+        // cloned Arc). notify_one stores a permit, so a close before the task polls is kept.
+        let close_signal = Arc::new(Notify::new());
+        let close_wait = Arc::clone(&close_signal);
         let closed = Arc::new(AtomicBool::new(false));
-        self.stdin_close = Some((close_tx, Arc::clone(&closed)));
+        self.stdin_close = Some((close_signal, Arc::clone(&closed)));
         tokio::spawn(async move {
             // Once a close is requested: accept no new frames, but still deliver every frame a
             // `send` already returned Ok for (often the final protocol message). The deadline
@@ -552,7 +556,7 @@ impl ManagedChild {
                     },
                     None => tokio::select! {
                         biased;
-                        _ = &mut close_rx => {
+                        () = close_wait.notified() => {
                             rx.close();
                             flush_deadline = Some(tokio::time::Instant::now() + STDIN_FLUSH_TIMEOUT);
                             continue;
@@ -570,7 +574,7 @@ impl ManagedChild {
                         biased;
                         res = &mut write => Ok(res),
                         // Close requested mid-write: finish this frame within the deadline.
-                        _ = &mut close_rx => {
+                        () = close_wait.notified() => {
                             rx.close();
                             let deadline = tokio::time::Instant::now() + STDIN_FLUSH_TIMEOUT;
                             flush_deadline = Some(deadline);
@@ -594,7 +598,7 @@ impl ManagedChild {
             // Flag first, so every send starting after this call fails instead of queueing a
             // frame the writer task will never deliver.
             closed.store(true, AtomicOrdering::Release);
-            let _ = close.send(());
+            close.notify_one();
         }
     }
 

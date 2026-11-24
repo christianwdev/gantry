@@ -144,12 +144,13 @@ impl Job {
     /// Returns `true` if the job emptied. Used by ordered workspace teardown before
     /// `git worktree remove` so no process still holds files open.
     pub async fn wait_until_empty(&self, timeout: Duration) -> Result<bool> {
-        let deadline = Instant::now() + timeout;
+        // `None` (e.g. `Duration::MAX`) means no deadline instead of an overflow panic.
+        let deadline = Instant::now().checked_add(timeout);
         loop {
             if self.active_processes()? == 0 {
                 return Ok(true);
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(false);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

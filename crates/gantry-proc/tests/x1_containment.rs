@@ -575,6 +575,29 @@ async fn close_stdin_flushes_frames_already_accepted() {
     assert!(child.wait().await.unwrap().success());
 }
 
+/// Review fix: dropping the ManagedChild (while its job lives on via a clone) must not close a
+/// still-running agent's stdin — only an explicit close_stdin() does.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_child_handle_does_not_close_stdin() {
+    let mut child = ManagedCommand::new(FIXTURE)
+        .arg("echo")
+        .stdin(Stdio::Piped)
+        .stdout(Stdio::Piped)
+        .spawn()
+        .unwrap();
+    let job = Arc::clone(child.job()); // e.g. held by a Resource Governor
+    let writer = child.stdin_writer(8).unwrap();
+    let mut out = LineReader::new(child.stdout.take().unwrap(), DEFAULT_MAX_LINE);
+    drop(child);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    writer.send_line("still here").await.unwrap();
+    assert_eq!(
+        out.next_line().await.unwrap(),
+        Some(Line::Text("echo:still here".into()))
+    );
+    drop(job); // last job handle: the agent dies now
+}
+
 /// Review fix: a send issued right after close_stdin() must fail, not be silently dropped.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_after_close_stdin_fails_immediately() {
