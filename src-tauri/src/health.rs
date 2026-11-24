@@ -229,6 +229,12 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
                         "`{program} --version` exited without printing a version, but {lingered}"
                     )
                 }
+                // Never launched: resolution / CreateProcessW itself took too long (typically
+                // a PATH entry on an unreachable network share), not the tool hanging.
+                (_, None, None) if status.path.is_none() => format!(
+                    "resolving or launching `{program}` timed out after {secs}s \
+                     (check PATH for unreachable network locations)"
+                ),
                 (_, None, None) => format!("`{program} --version` timed out"),
             });
         }

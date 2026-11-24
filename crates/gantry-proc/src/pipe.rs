@@ -46,6 +46,12 @@ pub(crate) enum Direction {
 ///
 /// Must be called within a Tokio runtime (the server end registers with the reactor).
 pub(crate) fn pipe_pair(direction: Direction) -> Result<(NamedPipeServer, OwnedHandle)> {
+    // Registering the server with the reactor panics without a runtime; report it instead.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Err(Error::Io(std::io::Error::other(
+            "Stdio::Piped requires spawning from within a Tokio runtime",
+        )));
+    }
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);

@@ -661,6 +661,16 @@ async fn shutdown_ladder_prefers_eof_then_kills() {
     assert!(t.elapsed() >= Duration::from_millis(300));
 }
 
+/// Review fix: piped spawning outside a runtime is an error, not a panic.
+#[test]
+fn piped_spawn_without_runtime_is_an_error() {
+    let res = ManagedCommand::new(FIXTURE)
+        .arg("sleep")
+        .stdout(Stdio::Piped)
+        .spawn();
+    assert!(res.is_err(), "expected an error without a Tokio runtime");
+}
+
 #[test]
 fn refuses_script_shims() {
     let err = ManagedCommand::new("something.cmd").spawn().unwrap_err();

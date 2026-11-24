@@ -95,13 +95,6 @@ fn focus_main_window(app: &AppHandle) {
 pub fn run() {
     let builder = specta_builder();
 
-    // Dev convenience only: a debug binary run outside the source tree (where the baked-in
-    // path does not exist) must still start. The bindings test is the authoritative export.
-    #[cfg(debug_assertions)]
-    if let Err(e) = export_bindings_if_changed(&builder) {
-        eprintln!("warning: could not export TypeScript bindings to {BINDINGS_PATH}: {e}");
-    }
-
     tauri::Builder::default()
         // Must be registered first so a second launch exits before doing any work.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -109,6 +102,14 @@ pub fn run() {
         }))
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
+            // Inside setup, so only the primary instance (past the single-instance check)
+            // does this dev-time I/O. A debug binary run outside the source tree (where the
+            // baked-in path does not exist) must still start; the bindings test is the
+            // authoritative export.
+            #[cfg(debug_assertions)]
+            if let Err(e) = export_bindings_if_changed(&builder) {
+                eprintln!("warning: could not export TypeScript bindings to {BINDINGS_PATH}: {e}");
+            }
             builder.mount_events(app);
             Ok(())
         })

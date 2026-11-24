@@ -498,7 +498,9 @@ impl ManagedChild {
     /// Moves stdin into a dedicated writer task with a queue of `capacity` frames and returns
     /// a cloneable handle to it. `None` if stdin was not piped or was already taken.
     ///
-    /// Must be called within a Tokio runtime.
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime (it spawns the writer task).
     pub fn stdin_writer(&mut self, capacity: usize) -> Option<StdinWriter> {
         let mut pipe = self.stdin.take()?;
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(capacity.max(1));
@@ -507,9 +509,11 @@ impl ManagedChild {
         self.stdin_close = Some((close_tx, Arc::clone(&closed)));
         tokio::spawn(async move {
             // Once a close is requested: accept no new frames, but still deliver every frame a
-            // `send` already returned Ok for (often the final protocol message), as long as the
-            // child keeps reading. A full pipe (child not reading) can't block the close past
-            // the flush deadline.
+            // `send` already returned Ok for (often the final protocol message). The deadline
+            // bounds how long *this task* keeps handing frames to the pipe. Note that the
+            // reactor buffers each write and completes it in the background, so the child's
+            // EOF arrives once it has read the last handed-over frame: delivery order is kept,
+            // and a child that never reads again is dealt with by the shutdown ladder's kill.
             let mut flush_deadline: Option<tokio::time::Instant> = None;
             loop {
                 let frame = match flush_deadline {

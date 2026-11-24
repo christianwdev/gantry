@@ -255,6 +255,18 @@ pub fn find_executable(
     cwd: Option<&Path>,
 ) -> Result<PathBuf> {
     let as_path = Path::new(program);
+    // An empty or dots-only name (e.g. an unset config value) would otherwise probe for files
+    // literally named `.exe` / `.com` in every PATH directory.
+    if program
+        .to_string_lossy()
+        .trim()
+        .trim_matches('.')
+        .is_empty()
+    {
+        return Err(Error::NotFound {
+            program: program.to_owned(),
+        });
+    }
     let is_path = program.to_string_lossy().contains(['\\', '/', ':']);
     if is_path {
         // Drive-relative (`C:tool.exe`: a drive prefix but no root) would resolve against
@@ -436,6 +448,21 @@ mod tests {
             matches!(err, Error::UnsupportedExecutable { .. }),
             "{err:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_or_dot_names_are_not_found() {
+        let dir = std::env::temp_dir().join(format!("gantry-proc-dots-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(system32().join("cmd.exe"), dir.join(".exe")).unwrap();
+        for name in ["", "  ", ".", ".."] {
+            let res = find_executable(OsStr::new(name), dir.as_os_str(), None);
+            assert!(
+                matches!(res, Err(Error::NotFound { .. })),
+                "{name:?}: {res:?}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
