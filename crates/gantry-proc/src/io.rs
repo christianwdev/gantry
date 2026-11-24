@@ -124,6 +124,9 @@ impl StderrTail {
         let task = tokio::spawn(async move {
             // stderr lines are diagnostics; cap them far lower than protocol lines.
             let mut reader = LineReader::new(reader, 1024 * 1024);
+            // Stopping on a read error cannot deadlock the child: when this task ends, `reader`
+            // (the pipe's server end) is dropped, so the child's further stderr writes fail
+            // with ERROR_NO_DATA instead of blocking on a full pipe.
             while let Ok(Some(line)) = reader.next_line().await {
                 let text = match line {
                     Line::Text(t) => t,

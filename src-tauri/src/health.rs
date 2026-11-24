@@ -92,28 +92,18 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         .env("DISABLE_AUTOUPDATER", "1")
         .stdout(Stdio::Piped);
 
-    match cmd.resolve_program() {
-        Ok(path) => status.path = Some(path.display().to_string()),
-        Err(e) => {
-            status.state = match &e {
-                gantry_proc::Error::NotFound { .. } => ToolState::Missing,
-                gantry_proc::Error::ShimOnly { shim, .. } => {
-                    status.path = Some(shim.display().to_string());
-                    ToolState::ShimOnly
-                }
-                _ => ToolState::Failed,
-            };
-            status.error = Some(e.to_string());
-            return status;
-        }
-    }
-
-    let run = async {
-        let mut child = cmd.spawn()?;
+    // PROBE_TIMEOUT covers everything, including resolution.
+    let run = async move {
+        // Resolution and CreateProcess do blocking registry/filesystem work (a PATH entry on an
+        // unreachable network share can stall for tens of seconds), so keep them off the async
+        // workers. If we time out meanwhile, the late ManagedChild is dropped -> tree killed.
+        let mut child = tokio::task::spawn_blocking(move || cmd.spawn())
+            .await
+            .map_err(|e| gantry_proc::Error::Io(std::io::Error::other(e)))??;
         // Drain stdout concurrently (so a full pipe can't stall the child), but finish on the
         // process exiting, not on EOF: a helper that inherited stdout would hold it open.
         let mut stdout = child.stdout.take();
-        let reader = tokio::spawn(async move {
+        let mut reader = tokio::spawn(async move {
             let mut out = Vec::new();
             if let Some(stdout) = stdout.as_mut() {
                 let _ = stdout.read_to_end(&mut out).await;
@@ -124,7 +114,6 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         // Give leftover processes a grace period first: a launcher stub may exit before the
         // real binary it started has printed the version. Only if stdout is still open after
         // that (a helper holding it) kill the tree, which closes the pipe -> EOF.
-        let mut reader = reader;
         let out = match tokio::time::timeout(READ_GRACE, &mut reader).await {
             Ok(joined) => joined.unwrap_or_default(),
             Err(_) => {
@@ -141,27 +130,30 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         let out = String::from_utf8_lossy(&out).into_owned();
         Ok::<_, gantry_proc::Error>((exit, out, child.program().to_path_buf()))
     };
-    let result = tokio::time::timeout(PROBE_TIMEOUT, run).await;
-    // Report the executable that actually ran (spawn re-resolves; PATH may have changed).
-    if let Ok(Ok((_, _, ran))) = &result {
-        status.path = Some(ran.display().to_string());
-    }
-    match result {
-        Ok(Ok((exit, out, _))) if exit.success() => {
-            match out.lines().map(str::trim).find(|l| !l.is_empty()) {
-                Some(line) => {
-                    status.state = ToolState::Ok;
-                    status.version = Some(line.to_owned());
-                }
-                None => {
-                    status.error = Some(format!("`{program} --version` printed no version"));
-                }
+    match tokio::time::timeout(PROBE_TIMEOUT, run).await {
+        Ok(Ok((exit, out, ran))) => {
+            // Report the executable that actually ran.
+            status.path = Some(ran.display().to_string());
+            if !exit.success() {
+                status.error = Some(format!("`{program} --version` failed: {exit}"));
+            } else if let Some(line) = out.lines().map(str::trim).find(|l| !l.is_empty()) {
+                status.state = ToolState::Ok;
+                status.version = Some(line.to_owned());
+            } else {
+                status.error = Some(format!("`{program} --version` printed no version"));
             }
         }
-        Ok(Ok((exit, _, _))) => {
-            status.error = Some(format!("`{program} --version` failed: {exit}"));
+        Ok(Err(e)) => {
+            match &e {
+                gantry_proc::Error::NotFound { .. } => status.state = ToolState::Missing,
+                gantry_proc::Error::ShimOnly { shim, .. } => {
+                    status.state = ToolState::ShimOnly;
+                    status.path = Some(shim.display().to_string());
+                }
+                _ => {}
+            }
+            status.error = Some(e.to_string());
         }
-        Ok(Err(e)) => status.error = Some(e.to_string()),
         // Dropping the child (and its job) inside `run` killed the probe's process tree.
         Err(_) => status.error = Some(format!("`{program} --version` timed out")),
     }

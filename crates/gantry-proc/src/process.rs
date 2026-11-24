@@ -162,6 +162,11 @@ impl ManagedCommand {
     /// Spawns the child inside its job with `CREATE_NO_WINDOW` and a restricted handle list.
     ///
     /// Must be called within a Tokio runtime when any stream is [`Stdio::Piped`].
+    ///
+    /// This is synchronous and does blocking work: registry reads (PATH merge), a stat per
+    /// candidate file in every PATH directory (slow on unreachable network shares) and
+    /// `CreateProcessW`. From latency-sensitive async code, call it via
+    /// `tokio::task::spawn_blocking` (blocking-pool threads have the runtime context it needs).
     pub fn spawn(&self) -> Result<ManagedChild> {
         let env = self.build_env();
         let program = find_executable(&self.program, &search_path(&env), self.cwd.as_deref())?;

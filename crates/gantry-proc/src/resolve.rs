@@ -53,7 +53,13 @@ pub fn merge_path_lists(lists: &[OsString]) -> OsString {
     for list in lists {
         for entry in split_path_list(list) {
             let mut wide: Vec<u16> = entry.encode_wide().collect();
-            while wide.len() > 1 && matches!(wide.last(), Some(&0x5C | &0x2F)) {
+            // Strip trailing separators, but never the root separator of `X:\`: `C:` (the
+            // drive's current directory) and `C:\` (its root) are different directories.
+            let is_drive_root = |w: &[u16]| w.len() == 3 && w[1] == u16::from(b':');
+            while wide.len() > 1
+                && matches!(wide.last(), Some(&0x5C | &0x2F))
+                && !is_drive_root(&wide)
+            {
                 wide.pop();
             }
             let key = OsString::from_wide(&wide);
@@ -399,6 +405,20 @@ mod tests {
         let found = find_executable(OsStr::new("tool"), dir.as_os_str(), None);
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(found.unwrap().extension().unwrap(), "com");
+    }
+
+    #[test]
+    fn drive_root_and_drive_relative_are_distinct() {
+        let merged = merge_path_lists(&[OsString::from(r"C:;C:\;C:\\;D:\x\")]);
+        let parts: Vec<OsString> = split_path_list(&merged).collect();
+        assert_eq!(
+            parts,
+            vec![
+                OsString::from("C:"),
+                OsString::from(r"C:\"),
+                OsString::from(r"D:\x\")
+            ]
+        );
     }
 
     #[test]
