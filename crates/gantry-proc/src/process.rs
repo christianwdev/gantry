@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::{
-    HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
+    HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
@@ -26,6 +26,9 @@ use crate::pipe::{Direction, null_handle, pipe_pair};
 use crate::resolve::{find_executable, merged_path, wide_nul};
 use crate::wait::wait_for_handle;
 use crate::{Error, Job, Result};
+
+/// How long `shutdown` waits for a terminated job to report zero processes.
+const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How a child's stdio stream is connected.
 ///
@@ -527,8 +530,10 @@ impl ManagedChild {
             return Ok(Some(status));
         }
         // SAFETY: valid process handle.
-        if unsafe { WaitForSingleObject(self.raw(), 0) } != WAIT_OBJECT_0 {
-            return Ok(None);
+        match unsafe { WaitForSingleObject(self.raw(), 0) } {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => return Ok(None),
+            _ => return Err(Error::last_os("WaitForSingleObject")),
         }
         let status = ExitStatus(self.exit_code()?);
         self.status = Some(status);
@@ -587,8 +592,35 @@ impl ManagedChild {
     /// 1. wait `eof_after` for a clean exit;
     /// 2. close stdin (EOF) — including a [`StdinWriter`] task's pipe — and wait until
     ///    `kill_after` (measured from the start);
-    /// 3. terminate this child's own job (its whole tree, never group siblings) and wait.
+    /// 3. terminate this child's own job (its whole tree, never group siblings) and wait;
+    /// 4. in every case, once the main process is gone, reap any descendants still alive in its
+    ///    job and wait (up to a few seconds) for the job to empty.
     pub async fn shutdown(
+        &mut self,
+        eof_after: Duration,
+        kill_after: Duration,
+    ) -> Result<ExitStatus> {
+        let status = self.stop_main_process(eof_after, kill_after).await?;
+        // The main process is gone, but helpers it started (MCP servers, dev servers) may still
+        // run in its job, holding ports and files (which would block `git worktree remove`).
+        // A finished shutdown means the whole tree is gone.
+        if self.job.active_processes().unwrap_or(1) > 0 {
+            tracing::debug!(
+                pid = self.pid,
+                "shutdown ladder: reaping leftover descendants"
+            );
+            self.kill_tree()?;
+            if !self.job.wait_until_empty(REAP_TIMEOUT).await? {
+                tracing::warn!(
+                    pid = self.pid,
+                    "descendants still alive after terminating job"
+                );
+            }
+        }
+        Ok(status)
+    }
+
+    async fn stop_main_process(
         &mut self,
         eof_after: Duration,
         kill_after: Duration,

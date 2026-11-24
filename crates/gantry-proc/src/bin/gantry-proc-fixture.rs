@@ -29,6 +29,15 @@ fn main() {
         "tree" => tree(Path::new(&args[1]), args[2].parse().expect("depth")),
         "host" => host(Path::new(&args[1]), &args[2..]),
         "echo" => echo(),
+        // Like an agent that started an MCP server: a long-lived helper, then normal work.
+        "echo-with-helper" => {
+            let helper = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("sleep")
+                .spawn()
+                .expect("spawn helper");
+            println!("helper:{}", helper.id());
+            echo();
+        }
         "args" => {
             for a in &args[1..] {
                 println!("{a:?}");

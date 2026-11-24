@@ -4,7 +4,8 @@
 //! the merged process + registry `PATH`, runs without a console window, and is killed with its
 //! whole tree if it hangs past the timeout.
 
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use gantry_proc::{ManagedCommand, Stdio};
 use serde::Serialize;
@@ -12,11 +13,13 @@ use specta::Type;
 use tokio::io::AsyncReadExt;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
-/// How long leftover processes may keep stdout open after the probed process exits before
-/// the probe kills its tree (covers launcher stubs whose real binary prints the version).
+/// Once output has appeared after the probed process exited, how long leftover processes may
+/// keep stdout open before the probe kills its tree (a helper holding the pipe).
 const READ_GRACE: Duration = Duration::from_secs(2);
 /// How long to finish reading after killing the probe's tree.
 const KILL_GRACE: Duration = Duration::from_secs(1);
+/// Poll interval while waiting for leftover output after the probed process exits.
+const POLL: Duration = Duration::from_millis(100);
 
 /// CLIs probed on startup: (display name, program, version args).
 const TOOLS: &[(&str, &str, &[&str])] = &[
@@ -100,34 +103,48 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         let mut child = tokio::task::spawn_blocking(move || cmd.spawn())
             .await
             .map_err(|e| gantry_proc::Error::Io(std::io::Error::other(e)))??;
-        // Drain stdout concurrently (so a full pipe can't stall the child), but finish on the
-        // process exiting, not on EOF: a helper that inherited stdout would hold it open.
+        // Drain stdout concurrently (so a full pipe can't stall the child) into a shared
+        // buffer, but finish on the process exiting, not on EOF: a helper that inherited stdout
+        // would hold it open.
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = Arc::clone(&buf);
         let mut stdout = child.stdout.take();
         let mut reader = tokio::spawn(async move {
-            let mut out = Vec::new();
-            if let Some(stdout) = stdout.as_mut() {
-                let _ = stdout.read_to_end(&mut out).await;
+            let Some(stdout) = stdout.as_mut() else {
+                return;
+            };
+            let mut chunk = [0u8; 8192];
+            while let Ok(n @ 1..) = stdout.read(&mut chunk).await {
+                sink.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend_from_slice(&chunk[..n]);
             }
-            out
         });
         let exit = child.wait().await?;
-        // Give leftover processes a grace period first: a launcher stub may exit before the
-        // real binary it started has printed the version. Only if stdout is still open after
-        // that (a helper holding it) kill the tree, which closes the pipe -> EOF.
-        let out = match tokio::time::timeout(READ_GRACE, &mut reader).await {
-            Ok(joined) => joined.unwrap_or_default(),
-            Err(_) => {
-                let _ = child.kill_tree();
-                tokio::time::timeout(KILL_GRACE, reader)
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or_default()
+        // After exit: a launcher stub may have handed off to the real binary, which can take a
+        // while (cold start, AV scan) to print. So keep waiting while nothing has been printed
+        // (bounded by PROBE_TIMEOUT); once there is output, allow READ_GRACE for the rest, then
+        // kill the tree, which closes any pipe a lingering helper holds -> EOF.
+        let exited_at = Instant::now();
+        loop {
+            if tokio::time::timeout(POLL, &mut reader).await.is_ok() {
+                break;
             }
-        };
+            let has_output = buf
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .any(|b| !b.is_ascii_whitespace());
+            if has_output && exited_at.elapsed() >= READ_GRACE {
+                let _ = child.kill_tree();
+                let _ = tokio::time::timeout(KILL_GRACE, &mut reader).await;
+                break;
+            }
+        }
         // Don't leave detached helpers running after a probe.
         let _ = child.kill_tree();
-        let out = String::from_utf8_lossy(&out).into_owned();
+        let out =
+            String::from_utf8_lossy(&buf.lock().unwrap_or_else(|p| p.into_inner())).into_owned();
         Ok::<_, gantry_proc::Error>((exit, out, child.program().to_path_buf()))
     };
     match tokio::time::timeout(PROBE_TIMEOUT, run).await {
@@ -170,6 +187,18 @@ mod tests {
 
     /// Review fix: a launcher stub that starts the real binary and exits immediately must not
     /// have the real binary killed before it prints the version.
+    /// Review fix: a slow real binary (cold start / AV scan) printing after READ_GRACE must
+    /// still be reported, since nothing had been printed yet.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_waits_beyond_grace_for_a_slow_launcher() {
+        let script = "require('child_process').spawn(process.execPath, \
+            ['-e', 'setTimeout(() => console.log(\"v3.0.0\"), 3000)'], \
+            { stdio: ['ignore', 'inherit', 'ignore'], detached: true }).unref();";
+        let status = super::probe("SlowLauncher", "node", &["-e", script]).await;
+        assert_eq!(status.state, super::ToolState::Ok, "{status:?}");
+        assert_eq!(status.version.as_deref(), Some("v3.0.0"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn probe_waits_for_output_from_a_launcher_stubs_real_binary() {
         let script = "require('child_process').spawn(process.execPath, \

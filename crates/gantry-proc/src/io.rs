@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::task::JoinHandle;
 
+/// Consecutive stderr read errors after which `StderrTail` gives up on the stream.
+const MAX_CONSECUTIVE_READ_ERRORS: u32 = 8;
+
 /// Default maximum line length: 64 MiB.
 pub const DEFAULT_MAX_LINE: usize = 64 * 1024 * 1024;
 
@@ -124,13 +127,28 @@ impl StderrTail {
         let task = tokio::spawn(async move {
             // stderr lines are diagnostics; cap them far lower than protocol lines.
             let mut reader = LineReader::new(reader, 1024 * 1024);
-            // Stopping on a read error cannot deadlock the child: when this task ends, `reader`
-            // (the pipe's server end) is dropped, so the child's further stderr writes fail
-            // with ERROR_NO_DATA instead of blocking on a full pipe.
-            while let Ok(Some(line)) = reader.next_line().await {
-                let text = match line {
-                    Line::Text(t) => t,
-                    Line::Oversized { len } => format!("<{len} byte line elided>"),
+            // Keep draining through transient read errors: if this task ended, `reader` (the
+            // pipe's server end) would be dropped and a still-running child's next stderr write
+            // would fail (EPIPE), which can crash e.g. Node-based agents. Only a run of
+            // consecutive errors (a genuinely broken pipe) ends the drain.
+            let mut consecutive_errors = 0u32;
+            loop {
+                let text = match reader.next_line().await {
+                    Ok(None) => break,
+                    Ok(Some(line)) => {
+                        consecutive_errors = 0;
+                        match line {
+                            Line::Text(t) => t,
+                            Line::Oversized { len } => format!("<{len} byte line elided>"),
+                        }
+                    }
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= MAX_CONSECUTIVE_READ_ERRORS {
+                            break;
+                        }
+                        format!("<stderr read error: {e}>")
+                    }
                 };
                 on_line(&text);
                 let mut ring = sink.lock().unwrap_or_else(|p| p.into_inner());
@@ -194,6 +212,36 @@ mod tests {
                 Line::Text("last".into()),
             ]
         );
+    }
+
+    /// Yields one transient error, then a line, then EOF.
+    struct FlakyOnce(u8);
+
+    impl AsyncRead for FlakyOnce {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.0 += 1;
+            std::task::Poll::Ready(match self.0 {
+                1 => Err(std::io::Error::other("transient")),
+                2 => {
+                    buf.put_slice(b"after error\n");
+                    Ok(())
+                }
+                _ => Ok(()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn stderr_tail_keeps_draining_after_a_transient_error() {
+        let tail = StderrTail::spawn(FlakyOnce(0), 10, |_| {});
+        let lines = tail.finished().await;
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("<stderr read error"), "{lines:?}");
+        assert_eq!(lines[1], "after error");
     }
 
     #[tokio::test]

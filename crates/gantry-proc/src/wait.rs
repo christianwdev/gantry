@@ -7,7 +7,8 @@ use std::sync::Mutex;
 
 use tokio::sync::oneshot;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Threading::{
     INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, RegisterWaitForSingleObject, UnregisterWaitEx,
@@ -67,8 +68,11 @@ pub(crate) async fn wait_for_handle(handle: BorrowedHandle<'_>) -> Result<()> {
 fn register(handle: BorrowedHandle<'_>) -> Result<Option<(Registration, oneshot::Receiver<()>)>> {
     let raw = handle.as_raw_handle() as HANDLE;
     // SAFETY: `raw` is a valid waitable handle, borrowed for the duration of the wait.
-    if unsafe { WaitForSingleObject(raw, 0) } == WAIT_OBJECT_0 {
-        return Ok(None);
+    match unsafe { WaitForSingleObject(raw, 0) } {
+        WAIT_OBJECT_0 => return Ok(None),
+        WAIT_TIMEOUT => {}
+        // WAIT_FAILED (bad handle / missing SYNCHRONIZE): report it rather than waiting forever.
+        _ => return Err(Error::last_os("WaitForSingleObject")),
     }
     let (tx, rx) = oneshot::channel();
     let ctx = Box::into_raw(Box::new(Mutex::new(Some(tx))));

@@ -522,6 +522,39 @@ async fn shutdown_closes_stdin_owned_by_writer_task() {
     assert!(writer.send_line("too late").await.is_err());
 }
 
+/// Review fix: a clean exit at the EOF step must still reap helpers the agent started (e.g.
+/// an MCP server), even while someone else holds a clone of the child's job.
+#[tokio::test(flavor = "multi_thread")]
+async fn clean_shutdown_still_reaps_the_agents_helpers() {
+    let mut child = ManagedCommand::new(FIXTURE)
+        .arg("echo-with-helper")
+        .stdin(Stdio::Piped)
+        .stdout(Stdio::Piped)
+        .spawn()
+        .unwrap();
+    let job_clone = Arc::clone(child.job()); // e.g. held by a Resource Governor
+    let mut out = LineReader::new(child.stdout.take().unwrap(), DEFAULT_MAX_LINE);
+    let helper: u32 = match out.next_line().await.unwrap() {
+        Some(Line::Text(t)) => t.strip_prefix("helper:").unwrap().parse().unwrap(),
+        other => panic!("{other:?}"),
+    };
+    let watched = Watched::open([helper]);
+
+    let status = child
+        .shutdown(Duration::from_millis(50), Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(
+        status.success(),
+        "main process should exit cleanly on EOF: {status}"
+    );
+    assert_eq!(
+        watched.survivors_after(Duration::from_secs(2)),
+        Vec::<u32>::new()
+    );
+    assert_eq!(job_clone.active_processes().unwrap(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_ladder_prefers_eof_then_kills() {
     // Exits cleanly once stdin closes (step 2).

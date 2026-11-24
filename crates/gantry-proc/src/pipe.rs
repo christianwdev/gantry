@@ -90,14 +90,18 @@ pub(crate) fn pipe_pair(direction: Direction) -> Result<(NamedPipeServer, OwnedH
 ///
 /// Built once and kept for the life of the process (never freed).
 fn owner_only_security_descriptor() -> Result<*mut c_void> {
-    static SD: OnceLock<std::result::Result<usize, i32>> = OnceLock::new();
-    match SD.get_or_init(|| build_owner_only_sd().map_err(|e| e.raw_os_error().unwrap_or(0))) {
-        Ok(sd) => Ok(*sd as *mut c_void),
-        Err(code) => Err(Error::Win32 {
-            op: "build owner-only pipe security descriptor",
-            source: std::io::Error::from_raw_os_error(*code),
-        }),
+    // Only success is cached: a transient failure (e.g. low memory) is retried next spawn
+    // instead of breaking every piped spawn for the rest of the session.
+    static SD: OnceLock<usize> = OnceLock::new();
+    if let Some(&sd) = SD.get() {
+        return Ok(sd as *mut c_void);
     }
+    let built = build_owner_only_sd().map_err(|source| Error::Win32 {
+        op: "build owner-only pipe security descriptor",
+        source,
+    })?;
+    // If another thread won the race, its descriptor is used and ours leaks (one-time, tiny).
+    Ok(*SD.get_or_init(|| built) as *mut c_void)
 }
 
 /// SDDL for the owner-only descriptor: protected (`P`), one allow-ACE, generic all.

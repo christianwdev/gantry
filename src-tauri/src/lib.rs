@@ -58,6 +58,24 @@ fn specta_builder() -> Builder<tauri::Wry> {
         .dangerously_cast_bigints_to_number()
 }
 
+/// Writes the bindings only when their content changed. An unconditional write on every dev
+/// launch makes Vite reload the page right after startup (re-running every probe) and lets a
+/// stale debug binary silently overwrite the checked-in file.
+#[cfg(debug_assertions)]
+fn export_bindings_if_changed(builder: &Builder<tauri::Wry>) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!("gantry-bindings-{}.ts", std::process::id()));
+    builder
+        .export(specta_typescript::Typescript::default(), &tmp)
+        .map_err(|e| e.to_string())?;
+    let fresh = std::fs::read(&tmp).map_err(|e| e.to_string());
+    let _ = std::fs::remove_file(&tmp);
+    let fresh = fresh?;
+    if std::fs::read(BINDINGS_PATH).ok().as_deref() != Some(fresh.as_slice()) {
+        std::fs::write(BINDINGS_PATH, fresh).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Brings the existing main window to the front (used when a second instance is launched).
 fn focus_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
@@ -79,7 +97,7 @@ pub fn run() {
     // Dev convenience only: a debug binary run outside the source tree (where the baked-in
     // path does not exist) must still start. The bindings test is the authoritative export.
     #[cfg(debug_assertions)]
-    if let Err(e) = builder.export(specta_typescript::Typescript::default(), BINDINGS_PATH) {
+    if let Err(e) = export_bindings_if_changed(&builder) {
         eprintln!("warning: could not export TypeScript bindings to {BINDINGS_PATH}: {e}");
     }
 
