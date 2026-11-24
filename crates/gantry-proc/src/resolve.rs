@@ -63,28 +63,46 @@ pub fn merge_path_lists(lists: &[OsString]) -> OsString {
         if i > 0 {
             joined.push(";");
         }
-        joined.push(entry);
+        // An entry that itself contains ';' must be quoted to survive re-splitting.
+        if entry.encode_wide().any(|c| c == SEMI) {
+            joined.push("\"");
+            joined.push(entry);
+            joined.push("\"");
+        } else {
+            joined.push(entry);
+        }
     }
     joined
 }
 
-/// Splits a `;`-separated path list, trimming whitespace and surrounding quotes on the raw
-/// UTF-16 so entries containing unpaired surrogates survive intact.
+const SEMI: u16 = b';' as u16;
+const DQUOTE: u16 = b'"' as u16;
+
+/// Splits a `;`-separated path list the way cmd.exe does: a `;` inside double quotes is part of
+/// the entry, and the quotes themselves are removed. Whitespace is trimmed. Works on raw UTF-16
+/// so entries containing unpaired surrogates survive intact.
 fn split_path_list(list: &OsStr) -> impl Iterator<Item = OsString> + '_ {
-    let wide: Vec<u16> = list.encode_wide().collect();
-    let is_trim = |c: &u16| matches!(*c, 0x20 | 0x09 | 0x0A | 0x0D | 0x22);
-    wide.split(|&c| c == b';' as u16)
-        .map(|part| {
-            let start = part.iter().position(|c| !is_trim(c)).unwrap_or(part.len());
+    let mut entries: Vec<Vec<u16>> = vec![Vec::new()];
+    let mut quoted = false;
+    for c in list.encode_wide() {
+        match c {
+            DQUOTE => quoted = !quoted,
+            SEMI if !quoted => entries.push(Vec::new()),
+            _ => entries.last_mut().expect("never empty").push(c),
+        }
+    }
+    let is_space = |c: &u16| matches!(*c, 0x20 | 0x09 | 0x0A | 0x0D);
+    entries
+        .into_iter()
+        .map(move |part| {
+            let start = part.iter().position(|c| !is_space(c)).unwrap_or(part.len());
             let end = part
                 .iter()
-                .rposition(|c| !is_trim(c))
+                .rposition(|c| !is_space(c))
                 .map_or(start, |i| i + 1);
             OsString::from_wide(&part[start..end])
         })
         .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .into_iter()
 }
 
 fn registry_path(root: HKEY, subkey: &str) -> Option<OsString> {
@@ -348,6 +366,23 @@ mod tests {
             parts,
             vec![OsString::from_wide(&expected), OsString::from(r"C:\y")]
         );
+    }
+
+    #[test]
+    fn quoted_semicolons_stay_in_one_entry_and_survive_rejoining() {
+        let list = OsString::from(r#"C:\a;"C:\Tools;v2\bin";C:\b"#);
+        let parts: Vec<OsString> = split_path_list(&list).collect();
+        assert_eq!(
+            parts,
+            vec![
+                OsString::from(r"C:\a"),
+                OsString::from(r"C:\Tools;v2\bin"),
+                OsString::from(r"C:\b"),
+            ]
+        );
+        let merged = merge_path_lists(&[list]);
+        assert_eq!(merged, OsString::from(r#"C:\a;"C:\Tools;v2\bin";C:\b"#));
+        assert_eq!(split_path_list(&merged).count(), 3);
     }
 
     #[test]

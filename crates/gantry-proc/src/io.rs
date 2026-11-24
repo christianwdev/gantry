@@ -19,8 +19,9 @@ pub const DEFAULT_MAX_LINE: usize = 64 * 1024 * 1024;
 pub enum Line {
     /// The line, with the trailing `\n` / `\r\n` removed. Invalid UTF-8 is replaced lossily.
     Text(String),
-    /// The line exceeded the limit and was discarded; `len` is its full length in bytes. The
-    /// reader has resynchronized on the next newline.
+    /// The line exceeded the limit and was discarded. `len` is the raw number of bytes
+    /// consumed, **including** its `\n` / `\r\n` terminator (unlike `Text`, which strips it).
+    /// The reader has resynchronized on the next newline.
     Oversized { len: usize },
 }
 
@@ -82,11 +83,13 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
         if oversized {
             return Ok(Some(Line::Oversized { len: total }));
         }
+        // Strip "\n" or "\r\n" only; a lone trailing '\r' on an unterminated final line is
+        // content, not a terminator.
         if self.buf.last() == Some(&b'\n') {
             self.buf.pop();
-        }
-        if self.buf.last() == Some(&b'\r') {
-            self.buf.pop();
+            if self.buf.last() == Some(&b'\r') {
+                self.buf.pop();
+            }
         }
         if self.buf.len() > self.max {
             return Ok(Some(Line::Oversized { len: total }));
@@ -187,6 +190,14 @@ mod tests {
                 Line::Text("bad\u{fffd}utf8".into()),
                 Line::Text("last".into()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lone_trailing_cr_on_final_line_is_content() {
+        assert_eq!(
+            lines(b"a\r\nabc\r", 1024).await,
+            vec![Line::Text("a".into()), Line::Text("abc\r".into())]
         );
     }
 

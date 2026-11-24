@@ -14,9 +14,13 @@
 //!   [`Job`] handle closes — including when Gantry itself is killed with `taskkill /F` — the whole
 //!   descendant tree dies.
 //! * **No console flashes.** `CREATE_NO_WINDOW` on every spawn.
-//! * **No handle leakage.** `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` restricts inheritance to exactly
-//!   the child's three stdio handles, so unrelated inheritable handles in Gantry (other children's
-//!   pipes, files) can never leak into a child and keep pipes open forever.
+//! * **No handle leakage into managed children.** `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` restricts
+//!   inheritance to exactly the child's three stdio handles, so unrelated inheritable handles in
+//!   Gantry (other children's pipes, files) never leak into a child spawned here. The reverse
+//!   direction has one residual, Windows-imposed window: the handle list requires the child's
+//!   stdio ends to be inheritable, so they are flipped inheritable only for the microseconds
+//!   around `CreateProcessW`. A *foreign* spawn (raw `std::process` in a dependency) racing that
+//!   instant could still inherit them — which is why raw spawns are banned in this workspace.
 //! * **Real executables only.** Programs resolve to a real `.exe`/`.com` (searching the process
 //!   `PATH` merged with the registry `PATH`, so Start-menu launches see freshly installed CLIs).
 //!   `.cmd`/`.bat` shims are rejected to avoid BatBadBut-style argument injection.

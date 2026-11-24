@@ -126,10 +126,16 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
             .ok()
             .and_then(Result::ok)
             .unwrap_or_default();
-        Ok::<_, gantry_proc::Error>((exit, String::from_utf8_lossy(&out).into_owned()))
+        let out = String::from_utf8_lossy(&out).into_owned();
+        Ok::<_, gantry_proc::Error>((exit, out, child.program().to_path_buf()))
     };
-    match tokio::time::timeout(PROBE_TIMEOUT, run).await {
-        Ok(Ok((exit, out))) if exit.success() => {
+    let result = tokio::time::timeout(PROBE_TIMEOUT, run).await;
+    // Report the executable that actually ran (spawn re-resolves; PATH may have changed).
+    if let Ok(Ok((_, _, ran))) = &result {
+        status.path = Some(ran.display().to_string());
+    }
+    match result {
+        Ok(Ok((exit, out, _))) if exit.success() => {
             match out.lines().map(str::trim).find(|l| !l.is_empty()) {
                 Some(line) => {
                     status.state = ToolState::Ok;
@@ -140,7 +146,9 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
                 }
             }
         }
-        Ok(Ok((exit, _))) => status.error = Some(format!("`{program} --version` failed: {exit}")),
+        Ok(Ok((exit, _, _))) => {
+            status.error = Some(format!("`{program} --version` failed: {exit}"));
+        }
         Ok(Err(e)) => status.error = Some(e.to_string()),
         // Dropping the child (and its job) inside `run` killed the probe's process tree.
         Err(_) => status.error = Some(format!("`{program} --version` timed out")),
