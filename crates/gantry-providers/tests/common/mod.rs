@@ -112,10 +112,14 @@ impl Harness {
         std::fs::create_dir_all(fixtures_dir()).unwrap();
         for session in sessions {
             let raw = std::fs::read_to_string(self.raw(session)).expect("raw log");
-            let sanitized: Vec<String> = raw
+            let records: Vec<Value> = raw
                 .lines()
                 .filter(|l| !l.trim().is_empty())
-                .map(|l| sanitize_record(serde_json::from_str(l).unwrap(), &self.root).to_string())
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let sanitized: Vec<String> = sanitize_session(records, &self.root)
+                .iter()
+                .map(Value::to_string)
                 .collect();
             std::fs::write(self.fixture(session), sanitized.join("\n") + "\n").unwrap();
         }
@@ -126,9 +130,104 @@ pub fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(r"tests\fixtures\claude")
 }
 
-/// Strips machine- and account-specific data so fixtures can live in a public repo.
-fn sanitize_record(mut record: Value, root: &Path) -> Value {
-    let frame = &mut record["frame"];
+/// Scrubs machine- and account-specific strings (work dir, home dir, user names).
+struct Scrubber {
+    /// (from, to), applied in order; names longest first.
+    pairs: Vec<(String, String)>,
+    /// The user names, for the final "nothing left" check.
+    names: Vec<String>,
+}
+
+impl Scrubber {
+    fn new(root: &Path) -> Self {
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        let root = root.to_string_lossy().into_owned();
+        // The username also appears outside full paths: in Claude's project slug
+        // (`C--Users-<name>-...`) and in streamed chunks. The account name and the profile
+        // folder name can differ (e.g. a renamed account), and it's the folder name that
+        // appears in paths — scrub both.
+        let account = std::env::var("USERNAME").unwrap_or_default();
+        let folder = Path::new(&home)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // A name this short can't be scrubbed without mangling unrelated text: refuse to
+        // record rather than silently commit it to a public repo.
+        for name in [&account, &folder] {
+            assert!(
+                name.chars().count() >= 3,
+                "username `{name}` is too short to scrub from fixtures safely; record elsewhere"
+            );
+        }
+        // Longest first, so "Alexandra" isn't half-replaced by "Alex".
+        let mut names = vec![account, folder];
+        names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+        names.dedup();
+        let escaped = |s: &str| s.replace('\\', "\\\\"); // as it appears inside JSON text
+        let mut pairs = vec![
+            (root.clone(), "%WORK%".to_owned()),
+            (escaped(&root), "%WORK%".to_owned()),
+            (home.clone(), "%HOME%".to_owned()),
+            (escaped(&home), "%HOME%".to_owned()),
+        ];
+        pairs.extend(names.iter().map(|n| (n.clone(), "user".to_owned())));
+        Scrubber { pairs, names }
+    }
+
+    fn scrub_str(&self, s: &str) -> String {
+        let mut out = s.to_owned();
+        for (from, to) in &self.pairs {
+            if !from.is_empty() {
+                out = replace_ci(&out, from, to);
+            }
+        }
+        out
+    }
+
+    fn scrub_value(&self, v: &mut Value) {
+        match v {
+            Value::String(s) => *s = self.scrub_str(s),
+            Value::Array(a) => a.iter_mut().for_each(|x| self.scrub_value(x)),
+            Value::Object(o) => o.values_mut().for_each(|x| self.scrub_value(x)),
+            _ => {}
+        }
+    }
+
+    fn leaks(&self, s: &str) -> bool {
+        let lower = s.to_lowercase();
+        self.names.iter().any(|n| lower.contains(&n.to_lowercase()))
+    }
+}
+
+/// Strips machine- and account-specific data from a whole recorded session so it can live in
+/// a public repo, and fails loudly if anything identifying survives.
+fn sanitize_session(mut records: Vec<Value>, root: &Path) -> Vec<Value> {
+    let scrubber = Scrubber::new(root);
+    for record in &mut records {
+        strip_inventory(&mut record["frame"]);
+        scrubber.scrub_value(record);
+    }
+    // Streamed deltas can split a name across chunks (`...Users\\Ch` + `ris\\App...`), which
+    // per-string scrubbing can't see. Join each content block's deltas, scrub the joined text,
+    // and put it back as one delta (the rest emptied) — the replayed text is unchanged.
+    scrub_split_deltas(&mut records, &scrubber);
+    for record in &records {
+        let text = record.to_string();
+        assert!(
+            !scrubber.leaks(&text),
+            "a user name survived sanitizing: {text}"
+        );
+    }
+    let joined: String = records.iter().filter_map(delta_text).collect();
+    assert!(
+        !scrubber.leaks(&joined),
+        "a user name survives in the joined streamed deltas"
+    );
+    records
+}
+
+/// Removes the user's installed-tooling inventory and account details.
+fn strip_inventory(frame: &mut Value) {
     // initialize response: account details and the user's installed commands/agents.
     if frame["type"] == "control_response"
         && let Some(resp) = frame
@@ -155,57 +254,81 @@ fn sanitize_record(mut record: Value, root: &Path) -> Value {
             obj.remove(key);
         }
     }
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    let root = root.to_string_lossy().into_owned();
-    // The username also appears outside full paths: in Claude's project slug
-    // (`C--Users-<name>-...`) and inside streamed partial_json/text chunks that split a path.
-    // The account name and the profile folder name can differ (e.g. a renamed account), and
-    // it's the folder name that appears in paths — scrub both.
-    let account = std::env::var("USERNAME").unwrap_or_default();
-    let folder = Path::new(&home)
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    // A name this short can't be scrubbed without mangling unrelated text: refuse to record
-    // rather than silently commit it to a public repo.
-    for name in [&account, &folder] {
-        assert!(
-            name.chars().count() >= 3,
-            "username `{name}` is too short to scrub from fixtures safely; record elsewhere"
-        );
+}
+
+/// The delta payload field name for a `content_block_delta` record, if any.
+fn delta_field(record: &Value) -> Option<&'static str> {
+    if record["frame"]["type"] != "stream_event"
+        || record["frame"]["event"]["type"] != "content_block_delta"
+    {
+        return None;
     }
-    // Longest first, so "Alexandra" isn't half-replaced by "Alex".
-    let mut names = [account, folder];
-    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
-    replace_strings(
-        &mut record,
-        &[
-            (&root, "%WORK%"),
-            (&home, "%HOME%"),
-            (&names[0], "user"),
-            (&names[1], "user"),
-        ],
-    );
-    record
+    match record["frame"]["event"]["delta"]["type"].as_str()? {
+        "text_delta" => Some("text"),
+        "thinking_delta" => Some("thinking"),
+        "input_json_delta" => Some("partial_json"),
+        _ => None,
+    }
+}
+
+fn delta_text(record: &Value) -> Option<String> {
+    let field = delta_field(record)?;
+    record["frame"]["event"]["delta"][field]
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn scrub_split_deltas(records: &mut [Value], scrubber: &Scrubber) {
+    use std::collections::HashMap;
+    // One group per streamed content block: a `content_block_start` for (scope, index) opens a
+    // new group (later messages reuse block indices), deltas join the open group.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut open: HashMap<(String, u64), usize> = HashMap::new();
+    for (i, record) in records.iter().enumerate() {
+        let event = &record["frame"]["event"];
+        if record["frame"]["type"] != "stream_event" {
+            continue;
+        }
+        let key = (
+            record["frame"]["parent_tool_use_id"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned(),
+            event["index"].as_u64().unwrap_or(0),
+        );
+        if event["type"] == "content_block_start" {
+            groups.push(Vec::new());
+            open.insert(key, groups.len() - 1);
+        } else if delta_field(record).is_some() {
+            let group = *open.entry(key).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[group].push(i);
+        }
+    }
+    for idxs in &groups {
+        let joined: String = idxs
+            .iter()
+            .filter_map(|&i| delta_text(&records[i]))
+            .collect();
+        if !scrubber.leaks(&joined) {
+            continue;
+        }
+        let scrubbed = scrubber.scrub_str(&joined);
+        for (n, &i) in idxs.iter().enumerate() {
+            let field = delta_field(&records[i]).expect("delta record");
+            records[i]["frame"]["event"]["delta"][field] = Value::String(if n == 0 {
+                scrubbed.clone()
+            } else {
+                String::new()
+            });
+        }
+    }
 }
 
 /// Case-insensitive replacement: Windows paths and names come back in any case
 /// (`C:\Users\X` vs `c:\users\x`).
-fn replace_strings(v: &mut Value, pairs: &[(&str, &str)]) {
-    match v {
-        Value::String(s) => {
-            for (from, to) in pairs {
-                if !from.is_empty() {
-                    *s = replace_ci(s, from, to);
-                }
-            }
-        }
-        Value::Array(a) => a.iter_mut().for_each(|x| replace_strings(x, pairs)),
-        Value::Object(o) => o.values_mut().for_each(|x| replace_strings(x, pairs)),
-        _ => {}
-    }
-}
-
 fn replace_ci(haystack: &str, needle: &str, with: &str) -> String {
     let lower_hay = haystack.to_lowercase();
     let lower_needle = needle.to_lowercase();
@@ -284,5 +407,44 @@ impl Events {
 
     pub fn count(&self, pred: impl Fn(&ProviderEvent) -> bool) -> usize {
         self.seen.iter().filter(|e| pred(e)).count()
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn delta(text: &str) -> Value {
+        json!({"dir":"out","frame":{"type":"stream_event","parent_tool_use_id":null,
+            "event":{"type":"content_block_delta","index":0,
+                "delta":{"type":"input_json_delta","partial_json":text}}}})
+    }
+
+    /// A user name split across two streamed chunks is still scrubbed, and the replayed text
+    /// (the joined deltas) keeps everything else.
+    #[test]
+    fn names_split_across_deltas_are_scrubbed() {
+        let home = std::env::var("USERPROFILE").unwrap();
+        let name = Path::new(&home)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let (a, b) = name.split_at(name.len() / 2);
+        let records = vec![
+            json!({"dir":"out","frame":{"type":"stream_event","parent_tool_use_id":null,
+                "event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use"}}}}),
+            delta(&format!("{{\"file_path\":\"D:\\x\\{a}")),
+            delta(&format!("{b}\\notes.txt\"}}")),
+        ];
+        let out = sanitize_session(records, Path::new(r"C:\no-such-root"));
+        let joined: String = out.iter().filter_map(delta_text).collect();
+        assert!(
+            !joined.to_lowercase().contains(&name.to_lowercase()),
+            "{joined}"
+        );
+        assert_eq!(joined, "{\"file_path\":\"D:\\x\\user\\notes.txt\"}");
     }
 }

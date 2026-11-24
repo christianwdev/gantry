@@ -27,7 +27,30 @@ async fn shutdown(session: ClaudeSession, events: &mut Events) {
         "shutdown took {:?}",
         t.elapsed()
     );
+    // Idempotent: a second shutdown reports "already stopped" instead of an error.
+    assert!(matches!(session.shutdown().await, Ok(None)));
     events.terminated().await;
+}
+
+/// Replay-only: a worker that dies during the `initialize` handshake (not logged in, bad flag)
+/// fails `spawn` with its stderr attached, not a bare "exited".
+pub async fn startup_failure(h: &Harness) {
+    let cwd = h.workdir("a");
+    let err = match ClaudeSession::spawn(h.config("main", &cwd)).await {
+        Ok(_) => panic!("the fixture dies before answering initialize"),
+        Err(e) => e,
+    };
+    match &err {
+        SessionError::StartupFailed { cause, stderr } => {
+            assert!(matches!(**cause, SessionError::Exited), "{cause:?}");
+            assert!(
+                stderr.iter().any(|l| l.contains("/login")),
+                "stderr must carry the reason: {stderr:?}"
+            );
+        }
+        other => panic!("expected StartupFailed, got {other:?}"),
+    }
+    assert!(err.to_string().contains("/login"), "{err}");
 }
 
 /// Five consecutive turns on one warm worker; the native session id stays stable.

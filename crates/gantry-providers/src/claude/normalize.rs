@@ -23,6 +23,8 @@ pub struct PendingInteraction {
     pub tool_name: String,
     /// The tool input as Claude sent it; an "allow" must echo it back as `updatedInput`.
     pub input: Value,
+    /// The event that announced it (re-emitted if an answer must be re-asked).
+    pub request: ProviderEvent,
 }
 
 #[derive(Debug, Default)]
@@ -330,42 +332,64 @@ impl Normalizer {
         let input = request.get("input").cloned().unwrap_or(Value::Null);
         let tool_call_id = str_field(request, "tool_use_id").map(str::to_owned);
         let interaction_id = request_id.to_owned();
-        self.open.push((
-            interaction_id.clone(),
-            PendingInteraction {
+        let event = if tool_name == ASK_USER_QUESTION {
+            ProviderEvent::QuestionsRequested {
                 turn_id: self.turn_id(),
-                tool_name: tool_name.clone(),
-                input: input.clone(),
-            },
-        ));
-        if tool_name == ASK_USER_QUESTION {
-            return vec![ProviderEvent::QuestionsRequested {
-                turn_id: self.turn_id(),
-                interaction_id,
+                interaction_id: interaction_id.clone(),
                 tool_call_id,
                 questions: parse_questions(&input),
-            }];
-        }
-        vec![ProviderEvent::ApprovalRequested {
-            turn_id: self.turn_id(),
+            }
+        } else {
+            ProviderEvent::ApprovalRequested {
+                turn_id: self.turn_id(),
+                interaction_id: interaction_id.clone(),
+                kind: if tool_name == EXIT_PLAN_MODE {
+                    ApprovalKind::Plan
+                } else {
+                    ApprovalKind::Tool
+                },
+                tool_call_id,
+                tool_name: tool_name.clone(),
+                description: str_field(request, "description")
+                    .or_else(|| str_field(request, "decision_reason"))
+                    .map(str::to_owned),
+                input: input.clone(),
+                suggestions: request
+                    .get("permission_suggestions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            }
+        };
+        self.open.push((
             interaction_id,
-            kind: if tool_name == EXIT_PLAN_MODE {
-                ApprovalKind::Plan
-            } else {
-                ApprovalKind::Tool
+            PendingInteraction {
+                turn_id: self.turn_id(),
+                tool_name,
+                input,
+                request: event.clone(),
             },
-            tool_call_id,
-            tool_name,
-            description: str_field(request, "description")
-                .or_else(|| str_field(request, "decision_reason"))
-                .map(str::to_owned),
-            input,
-            suggestions: request
-                .get("permission_suggestions")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-        }]
+        ));
+        vec![event]
+    }
+
+    /// Puts an interaction back after Gantry's answer failed to reach Claude (Claude is still
+    /// waiting on it) and re-announces it, so it can be answered again.
+    pub fn reopen(
+        &mut self,
+        interaction_id: String,
+        pending: PendingInteraction,
+    ) -> Vec<ProviderEvent> {
+        if self.open.iter().any(|(i, _)| *i == interaction_id) {
+            return Vec::new();
+        }
+        let event = pending.request.clone();
+        self.open.push((interaction_id, pending));
+        vec![event]
+    }
+
+    pub fn interrupt_requested_for(&self, turn_id: &str) -> bool {
+        self.interrupt_for.as_deref() == Some(turn_id)
     }
 
     fn system(&mut self, frame: &Value) -> Vec<ProviderEvent> {

@@ -32,4 +32,5 @@ replay!(
     shutdown_rejected_interrupt,
     deny_and_stop,
     dismiss_question,
+    startup_failure,
 );
