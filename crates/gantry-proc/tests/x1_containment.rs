@@ -671,6 +671,17 @@ fn relative_current_dir_is_refused() {
         .spawn()
         .unwrap_err();
     assert!(matches!(err, Error::RelativeCurrentDir { .. }), "{err:?}");
+    // Same error from spawn and resolve_program, even with a relative program path.
+    let mut cmd = ManagedCommand::new(r"bin\tool.exe");
+    cmd.current_dir("proj");
+    assert!(matches!(
+        cmd.spawn().unwrap_err(),
+        Error::RelativeCurrentDir { .. }
+    ));
+    assert!(matches!(
+        cmd.resolve_program().unwrap_err(),
+        Error::RelativeCurrentDir { .. }
+    ));
 }
 
 /// Review fix: piped spawning outside a runtime is an error, not a panic.

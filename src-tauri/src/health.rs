@@ -346,13 +346,21 @@ const DIAGNOSTIC_PREFIXES: &[&str] = &[
 /// `ERR!`, `(node:1234) ...`), followed by a word boundary.
 fn is_diagnostic(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    let lower = lower.trim_start_matches('[');
-    DIAGNOSTIC_PREFIXES.iter().any(|p| {
-        lower.strip_prefix(p).is_some_and(|rest| {
-            p.ends_with([':', '!'])
-                || !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    let starts_with_diagnostic = |s: &str| {
+        let s = s.trim_start_matches('[');
+        DIAGNOSTIC_PREFIXES.iter().any(|p| {
+            s.strip_prefix(p).is_some_and(|rest| {
+                p.ends_with([':', '!'])
+                    || !rest
+                        .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
         })
-    })
+    };
+    // At the start, or right after a leading tool name (`npm ERR! ...`, `node: warning ...`).
+    starts_with_diagnostic(&lower)
+        || lower
+            .split_once(char::is_whitespace)
+            .is_some_and(|(_, rest)| starts_with_diagnostic(rest.trim_start()))
 }
 
 /// The first line that [`looks_like_version`] and isn't a diagnostic, trimmed.
@@ -378,19 +386,29 @@ fn version_line(bytes: &[u8], program: &str) -> Option<String> {
 /// version-shaped token (see [`is_version_token`]). Guards against reporting an error banner,
 /// an IP address or a path as a healthy tool's version.
 fn looks_like_version(line: &str) -> bool {
-    line.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '"' | '\''))
-        .any(is_version_token)
+    let is_sep = |c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '"' | '\'');
+    let lower = line.to_ascii_lowercase();
+    // Whole-word match, so e.g. "description" doesn't count as "ip".
+    let network_context = lower.split(|c: char| !c.is_ascii_alphabetic()).any(|w| {
+        NETWORK_WORDS
+            .iter()
+            .any(|n| w == *n || w.starts_with(n) && *n != "ip")
+    });
+    line.split(is_sep)
+        .any(|t| is_version_token(t, network_context))
 }
 
 /// `v?N.N[.N[.N]]` with an optional suffix (`-beta`, `+build`, `.windows.1`):
 /// * at least two numeric groups (a bare `18` is not a version);
 /// * not inside a path or `host:port` (`C:\x\v1.2`, `127.0.0.1:9229`);
-/// * not an IPv4 address (four groups, each ≤ 255, nothing after) — whereas a 4-part build
-///   number like `10.0.19041.1` still counts.
-fn is_version_token(token: &str) -> bool {
+/// * not an IPv4 address: a bare dotted quad (four groups, each ≤ 255, nothing after) on a line
+///   with network context (`proxy`, `listening`, `host`, ...). A `v` prefix always means a
+///   version (`v1.2.3.4`), and a dotted quad elsewhere (`Antigravity 1.0.0.0`) is a version.
+fn is_version_token(token: &str, network_context: bool) -> bool {
     if token.contains(['\\', '/', ':', '@']) {
         return false;
     }
+    let v_prefixed = token.starts_with(['v', 'V']);
     let mut rest = token.strip_prefix(['v', 'V']).unwrap_or(token);
     let mut groups: Vec<u32> = Vec::new();
     loop {
@@ -405,9 +423,19 @@ fn is_version_token(token: &str) -> bool {
             _ => break,
         }
     }
-    let ipv4 = groups.len() == 4 && rest.is_empty() && groups.iter().all(|&g| g <= 255);
+    let ipv4 = network_context
+        && !v_prefixed
+        && groups.len() == 4
+        && rest.is_empty()
+        && groups.iter().all(|&g| g <= 255);
     groups.len() >= 2 && !ipv4
 }
+
+/// Words that make a bare dotted quad on the same line read as an IP address.
+const NETWORK_WORDS: &[&str] = &[
+    "proxy", "listen", "host", "address", "addr", "ip", "server", "connect", "http", "dns",
+    "gateway", "bind", "socket", "port",
+];
 
 /// "`x --version` failed: <exit>", plus the CLI's own first line of output (usually the reason,
 /// typically from stderr).
@@ -476,6 +504,8 @@ mod tests {
             "Warning: Node.js v18.0.0 is deprecated",
             "[warn] 1.2.3 is old",
             "ERR! code 1.0.0",
+            "npm ERR! engine Unsupported node 16.20.0",
+            "node: warning 1.2 is old",
             "Deprecated: v1.2",
             "(node:1234) ExperimentalWarning 1.2",
             "update available: 2.2.0",
@@ -502,6 +532,9 @@ mod tests {
             "git version 2.45.2.windows.1",
             "tool 10.0.19041.1",
             "x 1.2.3-beta+build.5",
+            "Antigravity 1.0.0.0",
+            "tool v1.2.3.4",
+            "description 1.0.0.0",
         ] {
             assert!(super::looks_like_version(v), "{v}");
         }

@@ -188,12 +188,13 @@ impl ManagedCommand {
     /// `CreateProcessW`. From latency-sensitive async code, call it via
     /// `tokio::task::spawn_blocking` (blocking-pool threads have the runtime context it needs).
     pub fn spawn(&self) -> Result<ManagedChild> {
+        // First, like resolve_program: same error for the same input, and no PATH scan first.
+        self.check_cwd()?;
         let env = self.build_env();
         let program = find_executable(&self.program, &search_path(&env), self.cwd.as_deref())?;
         let mut cmdline = command_line(&program, &self.args)?;
         let app_name = wide_nul(program.as_os_str());
         let env_block = env.to_block()?;
-        self.check_cwd()?;
         let cwd = match &self.cwd {
             Some(dir) => {
                 let dir = dunce::simplified(dir);

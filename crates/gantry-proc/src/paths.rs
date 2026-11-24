@@ -7,13 +7,42 @@ use std::path::{Path, PathBuf};
 /// `MAX_PATH`, reserved names like `CON`, components with trailing dots/spaces). Callers that
 /// hand paths to external tools should be aware such paths may break them. In both forms the
 /// drive letter is lower-cased, so `C:\x` and `c:\x` (and `\\?\C:\x` / `\\?\c:\x`) produce the
-/// same string.
+/// same string; likewise the (case-insensitive) server and share of UNC paths
+/// (`\\FILESRV\Proj\x` and `\\?\UNC\FILESRV\Proj\x` become `\\filesrv\proj\x` / `\\?\UNC\...`).
 ///
 /// Compare keys as strings (`as_os_str()`), not as `Path`s: `Path` equality already ignores
 /// drive-letter case, but hashing/serializing the raw string does not.
 pub fn normalize_path(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
     let canonical = dunce::canonicalize(path)?;
-    Ok(lowercase_drive_letter(canonical))
+    Ok(lowercase_unc_root(lowercase_drive_letter(canonical)))
+}
+
+/// Lower-cases the server and share of `\\server\share\...` and `\\?\UNC\server\share\...`.
+/// Paths that aren't valid UTF-8 are left as they are.
+fn lowercase_unc_root(path: PathBuf) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path;
+    };
+    let (prefix, rest) = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        (r"\\?\UNC\", rest)
+    } else if s.starts_with(r"\\") && !s.starts_with(r"\\?\") && !s.starts_with(r"\\.\") {
+        (r"\\", &s[2..])
+    } else {
+        return path;
+    };
+    let mut parts = rest.splitn(3, '\\');
+    let mut out = String::with_capacity(s.len());
+    out.push_str(prefix);
+    out.push_str(&parts.next().unwrap_or_default().to_lowercase());
+    if let Some(share) = parts.next() {
+        out.push('\\');
+        out.push_str(&share.to_lowercase());
+    }
+    if let Some(tail) = parts.next() {
+        out.push('\\');
+        out.push_str(tail);
+    }
+    PathBuf::from(out)
 }
 
 /// The 4-byte verbatim prefix `\\?\`.
@@ -43,6 +72,25 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+
+    #[test]
+    fn unc_server_and_share_are_lowercased_but_not_the_rest() {
+        let cases = [
+            (
+                r"\\FILESRV\Proj\Sub\File.TXT",
+                r"\\filesrv\proj\Sub\File.TXT",
+            ),
+            (r"\\?\UNC\FILESRV\Proj\Sub", r"\\?\UNC\filesrv\proj\Sub"),
+            (r"\\FILESRV", r"\\filesrv"),
+            (r"\\?\C:\X", r"\\?\C:\X"), // not UNC: untouched here
+            (r"\\.\PIPE\X", r"\\.\PIPE\X"),
+            (r"C:\X", r"C:\X"),
+        ];
+        for (input, expected) in cases {
+            let out = lowercase_unc_root(PathBuf::from(input));
+            assert_eq!(out.as_os_str(), OsStr::new(expected), "{input}");
+        }
+    }
 
     #[test]
     fn verbatim_prefix_is_four_bytes() {
