@@ -113,6 +113,24 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
     }
 }
 
+/// Maximum bytes of one retained `StderrTail` line.
+const MAX_TAIL_LINE: usize = 16 * 1024;
+
+/// Cuts `text` to at most [`MAX_TAIL_LINE`] bytes on a char boundary, marking the cut.
+fn truncate_for_tail(mut text: String) -> String {
+    if text.len() <= MAX_TAIL_LINE {
+        return text;
+    }
+    let total = text.len();
+    let mut cut = MAX_TAIL_LINE;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    text.push_str(&format!("… <{} more bytes>", total - cut));
+    text
+}
+
 /// Continuously drains a stream line-by-line into a bounded ring buffer.
 #[derive(Debug)]
 pub struct StderrTail {
@@ -165,7 +183,9 @@ impl StderrTail {
                     ring.pop_front();
                 }
                 if capacity > 0 {
-                    ring.push_back(text);
+                    // `on_line` saw the full line; the retained tail is diagnostics only, so cap
+                    // each entry to keep memory at ~capacity × 16 KiB, not capacity × 1 MiB.
+                    ring.push_back(truncate_for_tail(text));
                 }
             }
         });
@@ -278,6 +298,18 @@ mod tests {
             Some(Line::Text("next".into()))
         );
         assert_eq!(r.next_line().await.unwrap(), None);
+    }
+
+    #[test]
+    fn tail_lines_are_truncated_on_a_char_boundary() {
+        let short = "ok".to_owned();
+        assert_eq!(truncate_for_tail(short.clone()), short);
+        // 'é' is 2 bytes; an odd limit offset forces the boundary search.
+        let long = format!("x{}", "é".repeat(MAX_TAIL_LINE));
+        let cut = truncate_for_tail(long.clone());
+        assert!(cut.len() < MAX_TAIL_LINE + 64, "{}", cut.len());
+        assert!(cut.ends_with("more bytes>"));
+        assert!(long.starts_with(cut.split('…').next().unwrap()));
     }
 
     #[tokio::test]

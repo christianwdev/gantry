@@ -80,10 +80,23 @@ fn has_console_window() -> bool {
     !unsafe { GetConsoleWindow() }.is_null()
 }
 
-fn write_atomic(path: &Path, contents: &str) {
+/// Write-then-rename. Can transiently fail on Windows (the test reading the file, AV, the
+/// indexer), so callers retry instead of panicking — a panic would kill the hosted tree and
+/// make the containment tests flaky for reasons unrelated to the code under test.
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents).unwrap();
-    std::fs::rename(&tmp, path).unwrap();
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
+}
+
+fn write_atomic_retrying(path: &Path, contents: &str) {
+    for _ in 0..50 {
+        if write_atomic(path, contents).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("could not write {}", path.display());
 }
 
 /// A process tree node: reports, spawns a child node like any foreign program would, and
@@ -110,7 +123,7 @@ fn tree(dir: &Path, depth: u32) -> ! {
             Err(_) => "denied".into(),
         };
     }
-    write_atomic(
+    write_atomic_retrying(
         &dir.join(format!("tree-{}.txt", std::process::id())),
         &format!("console={console}\nbreakaway={breakaway}\n"),
     );
@@ -134,11 +147,15 @@ fn host(dir: &Path, commands: &[String]) -> ! {
     let jobs: Vec<Arc<Job>> = children.iter().map(|c| Arc::clone(c.job())).collect();
     let out: PathBuf = dir.join("host-job.txt");
     loop {
-        let mut pids: Vec<u32> = jobs.iter().flat_map(|j| j.process_ids().unwrap()).collect();
+        let mut pids: Vec<u32> = jobs
+            .iter()
+            .flat_map(|j| j.process_ids().unwrap_or_default())
+            .collect();
         pids.sort_unstable();
         pids.dedup();
         let text: Vec<String> = pids.iter().map(u32::to_string).collect();
-        write_atomic(&out, &text.join("\n"));
+        // Rewritten every tick, so a transiently failed write is simply retried next time.
+        let _ = write_atomic(&out, &text.join("\n"));
         std::thread::sleep(Duration::from_millis(100));
     }
 }

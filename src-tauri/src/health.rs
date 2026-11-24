@@ -131,9 +131,9 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
                     Ok(0) => break,
                     Ok(n) => {
                         consecutive_errors = 0;
-                        sink.lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .extend_from_slice(&chunk[..n]);
+                        let mut kept = sink.lock().unwrap_or_else(|p| p.into_inner());
+                        let room = MAX_CAPTURE.saturating_sub(kept.len());
+                        kept.extend_from_slice(&chunk[..n.min(room)]);
                     }
                     Err(_) if consecutive_errors < 8 => consecutive_errors += 1,
                     Err(_) => break,
@@ -166,19 +166,23 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         }
         // Don't leave detached helpers running after a probe.
         let _ = child.kill_tree();
-        let out =
-            String::from_utf8_lossy(&buf.lock().unwrap_or_else(|p| p.into_inner())).into_owned();
-        Ok::<_, gantry_proc::Error>((exit, out, child.program().to_path_buf()))
+        Ok::<_, gantry_proc::Error>((exit, child.program().to_path_buf()))
     };
     match tokio::time::timeout(PROBE_TIMEOUT, run).await {
-        Ok(Ok((exit, out, ran))) => {
+        Ok(Ok((exit, ran))) => {
             // Report the executable that actually ran.
             status.path = Some(ran.display().to_string());
+            let output = output.lock().unwrap_or_else(|p| p.into_inner());
             if !exit.success() {
                 status.error = Some(failure_message(program, exit, &output));
-            } else if let Some(line) = out.lines().map(str::trim).find(|l| !l.is_empty()) {
+            } else if let Some(version) = version_line(&output) {
                 status.state = ToolState::Ok;
-                status.version = Some(line.to_owned());
+                status.version = Some(version);
+            } else if let Some(line) = first_line(&output) {
+                // Exit 0 but nothing version-like (e.g. only a warning banner): not verified.
+                status.error = Some(format!(
+                    "`{program} --version` printed `{line}`, no version"
+                ));
             } else {
                 status.error = Some(format!("`{program} --version` printed no version"));
             }
@@ -198,33 +202,52 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         // Dropping the child (and its job) inside `run` killed the probe's process tree.
         Err(_) => {
             status.path = launched.lock().unwrap_or_else(|p| p.into_inner()).take();
-            let printed = first_line(&output.lock().unwrap_or_else(|p| p.into_inner()));
+            let output = output.lock().unwrap_or_else(|p| p.into_inner());
             let exit = *exited.lock().unwrap_or_else(|p| p.into_inner());
             let secs = PROBE_TIMEOUT.as_secs();
-            status.error = Some(match printed {
+            // Whether the probed process itself exited (only a leftover held stdout open).
+            let exited_ok = exit.is_some_and(|e| e.success());
+            let lingered = if exited_ok {
+                format!("a leftover process kept its output open past {secs}s")
+            } else {
+                format!("it did not exit within {secs}s")
+            };
+            status.error = Some(match (exit, version_line(&output), first_line(&output)) {
                 // The process already failed; the timeout only hit while draining leftovers.
-                _ if exit.is_some_and(|e| !e.success()) => {
-                    failure_message(program, exit.expect("checked"), &output)
-                }
+                (Some(e), _, _) if !e.success() => failure_message(program, e, &output),
                 // It answered but then hung (e.g. a slow update check): usable, but say so.
-                Some(line) if looks_like_version(&line) => {
+                (_, Some(version), _) => {
                     status.state = ToolState::Ok;
-                    status.version = Some(line);
-                    format!(
-                        "`{program} --version` printed a version but did not exit within {secs}s"
-                    )
+                    status.version = Some(version);
+                    format!("`{program} --version` printed a version, but {lingered}")
                 }
                 // An error banner or other text, then a hang: not healthy.
-                Some(line) => format!("`{program} --version` printed `{line}` and did not exit"),
-                None if exit.is_some_and(|e| e.success()) => format!(
-                    "`{program} --version` exited without printing a version \
-                     (a leftover process kept its output open)"
-                ),
-                None => format!("`{program} --version` timed out"),
+                (_, None, Some(line)) => {
+                    format!("`{program} --version` printed `{line}`, no version, and {lingered}")
+                }
+                (_, None, None) if exited_ok => {
+                    format!(
+                        "`{program} --version` exited without printing a version, but {lingered}"
+                    )
+                }
+                (_, None, None) => format!("`{program} --version` timed out"),
             });
         }
     }
     status
+}
+
+/// Only this much stdout is kept from a probe (the version is on the first lines); the rest is
+/// still drained so the CLI never blocks on a full pipe.
+const MAX_CAPTURE: usize = 64 * 1024;
+
+/// The first line that [`looks_like_version`], trimmed.
+fn version_line(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .find(|l| looks_like_version(l))
+        .map(str::to_owned)
 }
 
 /// Whether a line printed by `--version` plausibly is one (CLIs print e.g. `2.1.330 (Claude
@@ -238,9 +261,8 @@ fn looks_like_version(line: &str) -> bool {
 }
 
 /// "`x --version` failed: <exit>", plus the CLI's own first line of output (usually the reason).
-fn failure_message(program: &str, exit: ExitStatus, output: &Mutex<Vec<u8>>) -> String {
-    let printed = first_line(&output.lock().unwrap_or_else(|p| p.into_inner()));
-    match printed {
+fn failure_message(program: &str, exit: ExitStatus, output: &[u8]) -> String {
+    match first_line(output) {
         Some(line) => format!("`{program} --version` failed: {exit}: {line}"),
         None => format!("`{program} --version` failed: {exit}"),
     }
@@ -318,6 +340,25 @@ mod tests {
         assert!(!super::looks_like_version(
             "Error: Node.js 18 or newer is required"
         ));
+    }
+
+    /// Review fix: on exit 0 the version is the first version-looking line (a warning banner
+    /// before it is skipped); only a banner and no version is not a verified tool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exit_zero_picks_the_version_line_not_a_banner() {
+        let script =
+            "console.log('WARNING: could not update PATH'); console.log('codex-cli 0.171.0');";
+        let status = super::probe("Banner0", "node", &["-e", script]).await;
+        assert_eq!(
+            status.version.as_deref(),
+            Some("codex-cli 0.171.0"),
+            "{status:?}"
+        );
+
+        let script = "console.log('WARNING: could not update PATH');";
+        let status = super::probe("OnlyBanner", "node", &["-e", script]).await;
+        assert_eq!(status.state, super::ToolState::Failed, "{status:?}");
+        assert!(status.error.unwrap().contains("could not update PATH"));
     }
 
     /// Review fix: a failing `--version` reports the CLI's own reason, not just the code.

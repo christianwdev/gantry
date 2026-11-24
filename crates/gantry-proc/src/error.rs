@@ -13,6 +13,14 @@ pub enum Error {
     #[error("`{}` only resolves to a script shim ({}); a real .exe is required", program.display(), shim.display())]
     ShimOnly { program: OsString, shim: PathBuf },
 
+    /// A drive-relative program path (`C:tool.exe`) was given; it would resolve against the
+    /// process's per-drive current directory rather than the command's `current_dir`.
+    #[error(
+        "refusing drive-relative program path `{}`: use an absolute or plain relative path",
+        path.display()
+    )]
+    DriveRelativePath { path: PathBuf },
+
     /// An explicit path to a non-executable file type (e.g. `.cmd`, `.bat`, `.ps1`) was given.
     #[error("refusing to launch `{}`: only .exe/.com files may be spawned", path.display())]
     UnsupportedExecutable { path: PathBuf },

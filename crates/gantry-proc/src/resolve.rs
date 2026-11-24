@@ -11,7 +11,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 use windows_sys::Win32::System::Registry::{
@@ -257,6 +257,14 @@ pub fn find_executable(
     let as_path = Path::new(program);
     let is_path = program.to_string_lossy().contains(['\\', '/', ':']);
     if is_path {
+        // Drive-relative (`C:tool.exe`: a drive prefix but no root) would resolve against
+        // Gantry's own per-drive cwd, and `Path::join` with it discards `cwd` entirely. Refuse.
+        let has_prefix = matches!(as_path.components().next(), Some(Component::Prefix(_)));
+        if has_prefix && !as_path.has_root() {
+            return Err(Error::DriveRelativePath {
+                path: as_path.to_path_buf(),
+            });
+        }
         let full = match cwd {
             Some(dir) if as_path.is_relative() => dir.join(as_path),
             _ => as_path.to_path_buf(),
@@ -415,6 +423,18 @@ mod tests {
             "{err:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_relative_program_paths_are_refused() {
+        for p in [r"C:tool.exe", r"C:bin\tool.exe"] {
+            let err = find_executable(OsStr::new(p), OsStr::new(""), Some(Path::new(r"C:\work")))
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::DriveRelativePath { .. }),
+                "{p}: {err:?}"
+            );
+        }
     }
 
     #[test]
