@@ -7,12 +7,13 @@ use std::sync::Mutex;
 
 use tokio::sync::oneshot;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE,
     WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Threading::{
-    INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, RegisterWaitForSingleObject, UnregisterWaitEx,
-    WT_EXECUTEONLYONCE, WaitForSingleObject,
+    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, RegisterWaitForSingleObject, UnregisterWaitEx, WT_EXECUTEONLYONCE,
+    WaitForSingleObject,
 };
 
 use crate::{Error, Result};
@@ -108,7 +109,13 @@ fn register(handle: BorrowedHandle<'_>) -> Result<Option<(Registration, oneshot:
 /// Note that PIDs are recycled; prefer holding a process handle when identity matters.
 pub fn is_process_alive(pid: u32) -> bool {
     // SAFETY: OpenProcess with a plain pid; the returned handle is closed below.
-    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
     if handle.is_null() {
         // ERROR_INVALID_PARAMETER means no such process. Anything else (typically
         // ERROR_ACCESS_DENIED for elevated/protected/other-user processes) means it exists.
@@ -117,7 +124,15 @@ pub fn is_process_alive(pid: u32) -> bool {
     }
     // SAFETY: valid handle from OpenProcess, closed exactly once.
     unsafe {
-        let alive = WaitForSingleObject(handle, 0) != WAIT_OBJECT_0;
+        let alive = match WaitForSingleObject(handle, 0) {
+            WAIT_OBJECT_0 => false,
+            WAIT_TIMEOUT => true,
+            // WAIT_FAILED: don't guess "alive" — ask for the exit code instead.
+            _ => {
+                let mut code = 0u32;
+                GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE as u32
+            }
+        };
         CloseHandle(handle);
         alive
     }

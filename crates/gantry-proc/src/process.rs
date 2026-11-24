@@ -34,6 +34,9 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long closing stdin may spend delivering frames already accepted by `StdinWriter::send`.
 const STDIN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Upper bound for a `StdinWriter` queue (frames).
+const MAX_STDIN_QUEUE: usize = 65_536;
+
 /// How long the ladder waits for a terminated process to actually report exit.
 const TERMINATE_WAIT: Duration = Duration::from_secs(10);
 
@@ -475,8 +478,13 @@ pub struct StdinWriter {
 impl StdinWriter {
     /// Queues bytes for the child, waiting while the queue is full.
     ///
-    /// Fails with `BrokenPipe` once stdin is closed, the pipe broke (the child exited or closed
-    /// its stdin), or the writer task ended. A child that is alive but simply not reading does
+    /// `Ok` means **queued**, not delivered: a frame queued just as the child dies is lost
+    /// without an error here (the *next* `send` fails). Detect a dead agent with
+    /// [`ManagedChild::wait`], not with `send`.
+    ///
+    /// Fails with `BrokenPipe` once stdin is closed, after the writer task saw the pipe break
+    /// (the child exited or closed its stdin), or when the writer task ended. A child that is
+    /// alive but simply not reading does
     /// **not** make this fail: once the queue is full, `send` waits — wrap it in
     /// `tokio::time::timeout` if the caller must not block. Any `send` that starts after
     /// [`ManagedChild::close_stdin`] returned fails; a send racing the close itself may be
@@ -515,14 +523,16 @@ impl ManagedChild {
     }
 
     /// Moves stdin into a dedicated writer task with a queue of `capacity` frames and returns
-    /// a cloneable handle to it. `None` if stdin was not piped or was already taken.
+    /// a cloneable handle to it (`capacity` is clamped to 1..=65536). `None` if stdin was not
+    /// piped or was already taken.
     ///
     /// # Panics
     ///
     /// Panics if called outside a Tokio runtime (it spawns the writer task).
     pub fn stdin_writer(&mut self, capacity: usize) -> Option<StdinWriter> {
         let mut pipe = self.stdin.take()?;
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(capacity.max(1));
+        // Clamped: tokio panics on huge channel buffers, and frames past ~64k queued are a bug.
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(capacity.clamp(1, MAX_STDIN_QUEUE));
         let (close_tx, mut close_rx) = oneshot::channel::<()>();
         let closed = Arc::new(AtomicBool::new(false));
         self.stdin_close = Some((close_tx, Arc::clone(&closed)));

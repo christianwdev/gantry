@@ -356,11 +356,48 @@ fn is_diagnostic(line: &str) -> bool {
             })
         })
     };
-    // At the start, or right after a leading tool name (`npm ERR! ...`, `node: warning ...`).
+    // At the start, or right after a leading tool-name *prefix* — only in the marked forms
+    // `tool: warning ...` (tool name ends with ':') or `npm ERR! ...` (second word ends with
+    // '!' or ':'), so plain `mytool info 2.0.1` / `1.4.4 debug` stay version lines.
     starts_with_diagnostic(&lower)
         || lower
             .split_once(char::is_whitespace)
-            .is_some_and(|(_, rest)| starts_with_diagnostic(rest.trim_start()))
+            .is_some_and(|(first, rest)| {
+                let rest = rest.trim_start();
+                let second = rest.split_whitespace().next().unwrap_or("");
+                (first.ends_with(':') || second.ends_with(['!', ':']))
+                    && starts_with_diagnostic(rest)
+            })
+}
+
+/// Words that make a line a requirement/compatibility message rather than a version line
+/// (`Node.js 18.0.0 or newer is required`).
+const REQUIREMENT_WORDS: &[&str] = &[
+    "require",
+    "requires",
+    "required",
+    "newer",
+    "older",
+    "later",
+    "minimum",
+    "unsupported",
+    "supported",
+    "upgrade",
+    "install",
+    "please",
+];
+
+fn is_requirement_message(line: &str) -> bool {
+    line.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|w| REQUIREMENT_WORDS.contains(&w))
+}
+
+/// Whether `line` names `program` as a whole token (`codex-cli` names `codex`; `Ubuntu` does
+/// not name `bun`, nor `digital` `git`).
+fn names_program(line: &str, program: &str) -> bool {
+    line.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|t| t.eq_ignore_ascii_case(program))
 }
 
 /// The first line that [`looks_like_version`] and isn't a diagnostic, trimmed.
@@ -371,14 +408,24 @@ fn version_line(bytes: &[u8], program: &str) -> Option<String> {
     let candidates: Vec<&str> = text
         .lines()
         .map(str::trim)
-        .filter(|l| looks_like_version(l) && !is_diagnostic(l))
+        .filter(|l| looks_like_version(l) && !is_diagnostic(l) && !is_requirement_message(l))
         .collect();
-    let program = program.to_ascii_lowercase();
+    // Rank: names the program > version token early in the line (`1.4.4`, `codex-cli 0.171.0`,
+    // `2.1.330 (Claude Code)`) > anything else; ties keep output order.
+    let rank = |l: &&str| (names_program(l, program), version_token_is_early(l));
+    let best = candidates.iter().map(rank).max()?;
     candidates
         .iter()
-        .find(|l| l.to_ascii_lowercase().contains(&program))
-        .or(candidates.first())
+        .find(|l| rank(l) == best)
         .map(|l| (*l).to_owned())
+}
+
+/// Whether a version-shaped token is among the first two tokens of the line.
+fn version_token_is_early(line: &str) -> bool {
+    line.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '"' | '\''))
+        .filter(|t| !t.is_empty())
+        .take(2)
+        .any(|t| is_version_token(t, false))
 }
 
 /// Whether a line printed by `--version` plausibly is one (CLIs print e.g. `2.1.330 (Claude
@@ -531,6 +578,8 @@ mod tests {
             "info-cli 2.0.1",
             "notes-tool 3.1",
             "codex-cli 0.171.0",
+            "mytool info 2.0.1",
+            "1.4.4 debug",
         ] {
             assert!(!super::is_diagnostic(v), "{v}");
         }
@@ -569,6 +618,22 @@ mod tests {
             Some("codex-cli 0.171.0"),
             "a line naming the program wins"
         );
+        // Whole-token program match: "Ubuntu" does not name "bun".
+        let out = b"Detected Ubuntu 22.04 runtime\n1.4.4\n";
+        assert_eq!(super::version_line(out, "bun").as_deref(), Some("1.4.4"));
+        let out = b"Detected Ubuntu 22.04 runtime\ngit version 2.45.2.windows.1\n";
+        assert_eq!(
+            super::version_line(out, "git").as_deref(),
+            Some("git version 2.45.2.windows.1")
+        );
+        let out = b"Detected Ubuntu 22.04 runtime\nbun 1.4.4\n";
+        assert_eq!(
+            super::version_line(out, "bun").as_deref(),
+            Some("bun 1.4.4")
+        );
+        // Requirement messages are not versions, even with a full version number.
+        let out = b"Node.js 18.0.0 or newer is required\n";
+        assert_eq!(super::version_line(out, "codex"), None);
         assert!(!super::looks_like_version("Error: failed to load config"));
         assert!(!super::looks_like_version(
             "Error: Node.js 18 or newer is required"
