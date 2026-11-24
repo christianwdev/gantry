@@ -96,6 +96,8 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         .stdout(Stdio::Piped);
 
     // PROBE_TIMEOUT covers everything, including resolution.
+    let launched = Arc::new(Mutex::new(None::<String>));
+    let launched_slot = Arc::clone(&launched);
     let run = async move {
         // Resolution and CreateProcess do blocking registry/filesystem work (a PATH entry on an
         // unreachable network share can stall for tens of seconds), so keep them off the async
@@ -103,6 +105,9 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         let mut child = tokio::task::spawn_blocking(move || cmd.spawn())
             .await
             .map_err(|e| gantry_proc::Error::Io(std::io::Error::other(e)))??;
+        // Remember what actually launched, so even a timed-out probe can say which binary hung.
+        *launched_slot.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(child.program().display().to_string());
         // Drain stdout concurrently (so a full pipe can't stall the child) into a shared
         // buffer, but finish on the process exiting, not on EOF: a helper that inherited stdout
         // would hold it open.
@@ -114,10 +119,21 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
                 return;
             };
             let mut chunk = [0u8; 8192];
-            while let Ok(n @ 1..) = stdout.read(&mut chunk).await {
-                sink.lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .extend_from_slice(&chunk[..n]);
+            // Stop only at EOF or on a run of errors: dropping the pipe early on a transient
+            // error would give the CLI a broken pipe before it printed its version.
+            let mut consecutive_errors = 0;
+            loop {
+                match stdout.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        consecutive_errors = 0;
+                        sink.lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .extend_from_slice(&chunk[..n]);
+                    }
+                    Err(_) if consecutive_errors < 8 => consecutive_errors += 1,
+                    Err(_) => break,
+                }
             }
         });
         let exit = child.wait().await?;
@@ -174,7 +190,10 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
             status.error = Some(e.to_string());
         }
         // Dropping the child (and its job) inside `run` killed the probe's process tree.
-        Err(_) => status.error = Some(format!("`{program} --version` timed out")),
+        Err(_) => {
+            status.path = launched.lock().unwrap_or_else(|p| p.into_inner()).take();
+            status.error = Some(format!("`{program} --version` timed out"));
+        }
     }
     status
 }

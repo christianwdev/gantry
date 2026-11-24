@@ -600,7 +600,15 @@ impl ManagedChild {
         eof_after: Duration,
         kill_after: Duration,
     ) -> Result<ExitStatus> {
-        let status = self.stop_main_process(eof_after, kill_after).await?;
+        let result = self.stop_main_process(eof_after, kill_after).await;
+        if let Err(e) = &result {
+            // A wait failed mid-ladder (e.g. handle/thread-pool exhaustion): never return with
+            // the agent possibly still alive. Force the tree down, then reap below.
+            tracing::error!(pid = self.pid, error = %e, "shutdown ladder failed; forcing kill");
+            if self.kill_tree().is_err() {
+                let _ = self.kill();
+            }
+        }
         // The main process is gone, but helpers it started (MCP servers, dev servers) may still
         // run in its job, holding ports and files (which would block `git worktree remove`).
         // A finished shutdown means the whole tree is gone.
@@ -622,7 +630,7 @@ impl ManagedChild {
                 Err(e) => tracing::warn!(pid = self.pid, error = %e, "failed to reap descendants"),
             }
         }
-        Ok(status)
+        result
     }
 
     async fn stop_main_process(

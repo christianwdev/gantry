@@ -14,7 +14,6 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
-use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
     RegGetValueW,
@@ -31,11 +30,8 @@ const SHIM_EXTS: [&str; 4] = ["cmd", "bat", "ps1", "vbs"];
 /// (machine entries first, then user entries — the order Windows itself composes them).
 pub fn merged_path() -> OsString {
     let process = std::env::var_os("PATH").unwrap_or_default();
-    let machine = registry_path(
-        HKEY_LOCAL_MACHINE,
-        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
-    );
-    let user = registry_path(HKEY_CURRENT_USER, "Environment");
+    let machine = registry_path(HKEY_LOCAL_MACHINE, MACHINE_ENV);
+    let user = registry_path(HKEY_CURRENT_USER, USER_ENV);
     merge_path_lists(&[
         process,
         machine.unwrap_or_default(),
@@ -116,9 +112,13 @@ fn split_path_list(list: &OsStr) -> impl Iterator<Item = OsString> + '_ {
         .filter(|s| !s.is_empty())
 }
 
-fn registry_path(root: HKEY, subkey: &str) -> Option<OsString> {
+const MACHINE_ENV: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+const USER_ENV: &str = "Environment";
+
+/// Reads a `REG_SZ`/`REG_EXPAND_SZ` value *unexpanded* (no trailing NUL).
+fn registry_value(root: HKEY, subkey: &str, name: &OsStr) -> Option<Vec<u16>> {
     let subkey = wide_nul(OsStr::new(subkey));
-    let value = wide_nul(OsStr::new("Path"));
+    let value = wide_nul(name);
     let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
     let mut buf: Vec<u16> = vec![0; 2048];
     // Retry on ERROR_MORE_DATA: the value can grow between calls (an installer editing PATH).
@@ -139,7 +139,8 @@ fn registry_path(root: HKEY, subkey: &str) -> Option<OsString> {
         match rc {
             0 => {
                 let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-                return Some(expand_env(&buf[..len]));
+                buf.truncate(len);
+                return Some(buf);
             }
             ERROR_MORE_DATA => buf = vec![0; (size_bytes as usize).div_ceil(2) + 64],
             _ => return None,
@@ -148,23 +149,58 @@ fn registry_path(root: HKEY, subkey: &str) -> Option<OsString> {
     None
 }
 
-fn expand_env(raw: &[u16]) -> OsString {
-    let mut src = raw.to_vec();
-    src.push(0);
-    let mut cap = src.len() + 256;
-    loop {
-        let mut dst: Vec<u16> = vec![0; cap];
-        // SAFETY: `src` is NUL-terminated; `dst` is writable for `cap` u16s.
-        let n = unsafe { ExpandEnvironmentStringsW(src.as_ptr(), dst.as_mut_ptr(), cap as u32) }
-            as usize;
-        if n == 0 {
-            return OsString::from_wide(raw);
+/// Reads a registry `PATH` value and expands `%VARS%` against the **live** registry
+/// environment (user, then machine) before Gantry's own environment.
+///
+/// `ExpandEnvironmentStringsW` would use Gantry's process environment, which is exactly what
+/// is stale after an install: an installer that adds `NVM_SYMLINK` / `PNPM_HOME` and appends
+/// `%NVM_SYMLINK%` to PATH would otherwise leave a literal, unusable entry.
+fn registry_path(root: HKEY, subkey: &str) -> Option<OsString> {
+    let raw = registry_value(root, subkey, OsStr::new("Path"))?;
+    let lookup = |name: &OsStr| {
+        registry_value(HKEY_CURRENT_USER, USER_ENV, name)
+            .or_else(|| registry_value(HKEY_LOCAL_MACHINE, MACHINE_ENV, name))
+            .or_else(|| std::env::var_os(name).map(|v| v.encode_wide().collect()))
+    };
+    Some(OsString::from_wide(&expand_vars(&raw, &lookup, 4)))
+}
+
+/// Expands `%NAME%` references using `lookup`, recursing up to `depth` levels into values
+/// that are themselves `REG_EXPAND_SZ`. Unknown names stay literal (`%NAME%`) and scanning
+/// resumes at their closing `%`, as `ExpandEnvironmentStringsW` does.
+fn expand_vars(raw: &[u16], lookup: &dyn Fn(&OsStr) -> Option<Vec<u16>>, depth: u8) -> Vec<u16> {
+    const PCT: u16 = b'%' as u16;
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] != PCT {
+            out.push(raw[i]);
+            i += 1;
+            continue;
         }
-        if n <= cap {
-            return OsString::from_wide(&dst[..n.saturating_sub(1)]);
+        let Some(len) = raw[i + 1..].iter().position(|&c| c == PCT) else {
+            out.extend_from_slice(&raw[i..]);
+            break;
+        };
+        let name = &raw[i + 1..i + 1 + len];
+        let value = if name.is_empty() {
+            None
+        } else {
+            lookup(&OsString::from_wide(name))
+        };
+        match value {
+            Some(v) if depth > 0 => out.extend(expand_vars(&v, lookup, depth - 1)),
+            Some(v) => out.extend(v),
+            None => {
+                // Keep `%NAME` and let the closing `%` start the next candidate.
+                out.extend_from_slice(&raw[i..i + 1 + len]);
+                i += 1 + len;
+                continue;
+            }
         }
-        cap = n;
+        i += len + 2;
     }
+    out
 }
 
 pub(crate) fn wide_nul(s: &OsStr) -> Vec<u16> {
@@ -518,6 +554,37 @@ mod tests {
             OsString::from(r#"C:\B;"C:\C";C:\a\"#),
         ]);
         assert_eq!(merged, OsString::from(r"C:\A;c:\b\;C:\C"));
+    }
+
+    fn expand(raw: &str, vars: &[(&str, &str)]) -> String {
+        let lookup = |name: &OsStr| {
+            vars.iter()
+                .find(|(k, _)| OsStr::new(k).eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.encode_utf16().collect())
+        };
+        let wide: Vec<u16> = raw.encode_utf16().collect();
+        String::from_utf16(&expand_vars(&wide, &lookup, 4)).unwrap()
+    }
+
+    #[test]
+    fn expands_vars_from_injected_environment() {
+        let vars = [
+            ("NVM_HOME", r"C:\nvm"),
+            ("NVM_SYMLINK", r"%NVM_HOME%\nodejs"), // REG_EXPAND_SZ referencing another var
+            ("LOOP", "%LOOP%"),
+        ];
+        assert_eq!(
+            expand(r"%NVM_HOME%;%nvm_symlink%;C:\x", &vars),
+            r"C:\nvm;C:\nvm\nodejs;C:\x"
+        );
+        // Unknown names stay literal; the closing % may start the next reference.
+        assert_eq!(expand("%NOPE%NVM_HOME%", &vars), r"%NOPEC:\nvm");
+        assert_eq!(
+            expand("100%; %%; trailing %", &vars),
+            "100%; %%; trailing %"
+        );
+        // Self-reference terminates (depth-limited) instead of recursing forever.
+        assert_eq!(expand("%LOOP%", &vars), "%LOOP%");
     }
 
     #[test]
