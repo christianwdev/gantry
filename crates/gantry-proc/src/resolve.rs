@@ -726,9 +726,12 @@ mod tests {
         let merged = merged_path();
         let lower = merged.to_string_lossy().to_lowercase();
         assert!(lower.contains("system32"), "{lower}");
+        // The machine Path's `%SystemRoot%` entries (REG_EXPAND_SZ on every Windows install)
+        // must come out expanded. A blanket "no %" check would be wrong: REG_SZ values and
+        // unknown variables deliberately stay literal.
         assert!(
-            !lower.contains('%'),
-            "registry PATH should be expanded: {lower}"
+            !lower.contains("%systemroot%"),
+            "machine PATH not expanded: {lower}"
         );
     }
 }

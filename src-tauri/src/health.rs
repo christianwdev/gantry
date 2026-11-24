@@ -164,7 +164,7 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
             status.path = Some(ran.display().to_string());
             if !exit.success() {
                 status.error = Some(failure_message(program, exit, &captured));
-            } else if let Some(version) = captured.version() {
+            } else if let Some(version) = captured.version(program) {
                 status.state = ToolState::Ok;
                 status.version = Some(version);
             } else if let Some(line) = captured.first_line() {
@@ -211,32 +211,36 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
             } else {
                 format!("it did not exit within {secs}s")
             };
-            status.error = Some(match (exit, captured.version(), captured.first_line()) {
-                // The process already failed; the timeout only hit while draining leftovers.
-                (Some(e), _, _) if !e.success() => failure_message(program, e, &captured),
-                // It answered but then hung (e.g. a slow update check): usable, but say so.
-                (_, Some(version), _) => {
-                    status.state = ToolState::Ok;
-                    status.version = Some(version);
-                    format!("`{program} --version` printed a version, but {lingered}")
-                }
-                // An error banner or other text, then a hang: not healthy.
-                (_, None, Some(line)) => {
-                    format!("`{program} --version` printed `{line}`, no version, and {lingered}")
-                }
-                (_, None, None) if exited_ok => {
-                    format!(
-                        "`{program} --version` exited without printing a version, but {lingered}"
-                    )
-                }
-                // Never launched: resolution / CreateProcessW itself took too long (typically
-                // a PATH entry on an unreachable network share), not the tool hanging.
-                (_, None, None) if status.path.is_none() => format!(
-                    "resolving or launching `{program}` timed out after {secs}s \
+            status.error = Some(
+                match (exit, captured.version(program), captured.first_line()) {
+                    // The process already failed; the timeout only hit while draining leftovers.
+                    (Some(e), _, _) if !e.success() => failure_message(program, e, &captured),
+                    // It answered but then hung (e.g. a slow update check): usable, but say so.
+                    (_, Some(version), _) => {
+                        status.state = ToolState::Ok;
+                        status.version = Some(version);
+                        format!("`{program} --version` printed a version, but {lingered}")
+                    }
+                    // An error banner or other text, then a hang: not healthy.
+                    (_, None, Some(line)) => {
+                        format!(
+                            "`{program} --version` printed `{line}`, no version, and {lingered}"
+                        )
+                    }
+                    (_, None, None) if exited_ok => {
+                        format!(
+                            "`{program} --version` exited without printing a version, but {lingered}"
+                        )
+                    }
+                    // Never launched: resolution / CreateProcessW itself took too long (typically
+                    // a PATH entry on an unreachable network share), not the tool hanging.
+                    (_, None, None) if status.path.is_none() => format!(
+                        "resolving or launching `{program}` timed out after {secs}s \
                      (check PATH for unreachable network locations)"
-                ),
-                (_, None, None) => format!("`{program} --version` timed out"),
-            });
+                    ),
+                    (_, None, None) => format!("`{program} --version` timed out"),
+                },
+            );
         }
     }
     status
@@ -258,8 +262,9 @@ struct Captured {
 
 impl Captured {
     /// The version line: preferably from stdout, else from stderr (some CLIs print it there).
-    fn version(&self) -> Option<String> {
-        version_line(&lock(&self.stdout)).or_else(|| version_line(&lock(&self.stderr)))
+    fn version(&self, program: &str) -> Option<String> {
+        version_line(&lock(&self.stdout), program)
+            .or_else(|| version_line(&lock(&self.stderr), program))
     }
 
     /// The first non-empty line, preferring stdout; usually the reason for a failure.
@@ -351,22 +356,57 @@ fn is_diagnostic(line: &str) -> bool {
 }
 
 /// The first line that [`looks_like_version`] and isn't a diagnostic, trimmed.
-fn version_line(bytes: &[u8]) -> Option<String> {
+///
+/// A line naming the program (`codex-cli 0.171.0` for `codex`) wins over earlier ones.
+fn version_line(bytes: &[u8], program: &str) -> Option<String> {
     let text = String::from_utf8_lossy(bytes);
-    text.lines()
+    let candidates: Vec<&str> = text
+        .lines()
         .map(str::trim)
-        .find(|l| looks_like_version(l) && !is_diagnostic(l))
-        .map(str::to_owned)
+        .filter(|l| looks_like_version(l) && !is_diagnostic(l))
+        .collect();
+    let program = program.to_ascii_lowercase();
+    candidates
+        .iter()
+        .find(|l| l.to_ascii_lowercase().contains(&program))
+        .or(candidates.first())
+        .map(|l| (*l).to_owned())
 }
 
 /// Whether a line printed by `--version` plausibly is one (CLIs print e.g. `2.1.330 (Claude
-/// Code)`, `codex-cli 0.171.0`, `v24.18.1`, `git version 2.45.2`): it contains a dotted number
-/// (`<digit>.<digit>`). Guards against reporting an error banner as a healthy tool's version —
-/// a bare digit is not enough (`Error: Node.js 18 or newer is required`).
+/// Code)`, `codex-cli 0.171.0`, `v24.18.1`, `git version 2.45.2.windows.1`): it contains a
+/// version-shaped token (see [`is_version_token`]). Guards against reporting an error banner,
+/// an IP address or a path as a healthy tool's version.
 fn looks_like_version(line: &str) -> bool {
-    line.as_bytes()
-        .windows(3)
-        .any(|w| w[0].is_ascii_digit() && w[1] == b'.' && w[2].is_ascii_digit())
+    line.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '"' | '\''))
+        .any(is_version_token)
+}
+
+/// `v?N.N[.N[.N]]` with an optional suffix (`-beta`, `+build`, `.windows.1`):
+/// * at least two numeric groups (a bare `18` is not a version);
+/// * not inside a path or `host:port` (`C:\x\v1.2`, `127.0.0.1:9229`);
+/// * not an IPv4 address (four groups, each ≤ 255, nothing after) — whereas a 4-part build
+///   number like `10.0.19041.1` still counts.
+fn is_version_token(token: &str) -> bool {
+    if token.contains(['\\', '/', ':', '@']) {
+        return false;
+    }
+    let mut rest = token.strip_prefix(['v', 'V']).unwrap_or(token);
+    let mut groups: Vec<u32> = Vec::new();
+    loop {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            break;
+        }
+        groups.push(rest[..digits].parse().unwrap_or(u32::MAX));
+        rest = &rest[digits..];
+        match rest.strip_prefix('.') {
+            Some(after) if after.starts_with(|c: char| c.is_ascii_digit()) => rest = after,
+            _ => break,
+        }
+    }
+    let ipv4 = groups.len() == 4 && rest.is_empty() && groups.iter().all(|&g| g <= 255);
+    groups.len() >= 2 && !ipv4
 }
 
 /// "`x --version` failed: <exit>", plus the CLI's own first line of output (usually the reason,
@@ -459,9 +499,26 @@ mod tests {
             "codex-cli 0.171.0",
             "v24.18.1",
             "1.4.4",
+            "git version 2.45.2.windows.1",
+            "tool 10.0.19041.1",
+            "x 1.2.3-beta+build.5",
         ] {
             assert!(super::looks_like_version(v), "{v}");
         }
+        for not_version in [
+            "Using proxy 10.0.0.1",
+            "Listening on 127.0.0.1:9229",
+            r"Loaded config from C:\x\v1.2",
+            "Requires Node.js 18 or newer",
+        ] {
+            assert!(!super::looks_like_version(not_version), "{not_version}");
+        }
+        let out = b"Using proxy 10.0.0.1\nnode v1.0.0\ncodex-cli 0.171.0\n";
+        assert_eq!(
+            super::version_line(out, "codex").as_deref(),
+            Some("codex-cli 0.171.0"),
+            "a line naming the program wins"
+        );
         assert!(!super::looks_like_version("Error: failed to load config"));
         assert!(!super::looks_like_version(
             "Error: Node.js 18 or newer is required"

@@ -661,6 +661,18 @@ async fn shutdown_ladder_prefers_eof_then_kills() {
     assert!(t.elapsed() >= Duration::from_millis(300));
 }
 
+/// Review fix: a relative current_dir is refused instead of silently resolving against
+/// Gantry's own working directory.
+#[test]
+fn relative_current_dir_is_refused() {
+    let err = ManagedCommand::new(FIXTURE)
+        .arg("sleep")
+        .current_dir("worktrees/ws1")
+        .spawn()
+        .unwrap_err();
+    assert!(matches!(err, Error::RelativeCurrentDir { .. }), "{err:?}");
+}
+
 /// Review fix: piped spawning outside a runtime is an error, not a panic.
 #[test]
 fn piped_spawn_without_runtime_is_an_error() {

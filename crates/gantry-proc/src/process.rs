@@ -146,8 +146,18 @@ impl ManagedCommand {
 
     /// The resolved executable path this command would launch.
     pub fn resolve_program(&self) -> Result<PathBuf> {
+        self.check_cwd()?;
         let env = self.build_env();
         find_executable(&self.program, &search_path(&env), self.cwd.as_deref())
+    }
+
+    /// A relative `current_dir` would be resolved by `CreateProcessW` against Gantry's own
+    /// (arbitrary) working directory, so it is refused up front.
+    fn check_cwd(&self) -> Result<()> {
+        match &self.cwd {
+            Some(dir) if !dir.is_absolute() => Err(Error::RelativeCurrentDir { path: dir.clone() }),
+            _ => Ok(()),
+        }
     }
 
     fn build_env(&self) -> EnvMap {
@@ -183,6 +193,7 @@ impl ManagedCommand {
         let mut cmdline = command_line(&program, &self.args)?;
         let app_name = wide_nul(program.as_os_str());
         let env_block = env.to_block()?;
+        self.check_cwd()?;
         let cwd = match &self.cwd {
             Some(dir) => {
                 let dir = dunce::simplified(dir);

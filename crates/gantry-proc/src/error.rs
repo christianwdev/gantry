@@ -29,6 +29,10 @@ pub enum Error {
     )]
     RelativeWithoutCwd { path: PathBuf },
 
+    /// `current_dir` was relative; it would resolve against Gantry's own working directory.
+    #[error("current_dir `{}` must be an absolute path", path.display())]
+    RelativeCurrentDir { path: PathBuf },
+
     /// An explicit path to a non-executable file type (e.g. `.cmd`, `.bat`, `.ps1`) was given.
     #[error("refusing to launch `{}`: only .exe/.com files may be spawned", path.display())]
     UnsupportedExecutable { path: PathBuf },
@@ -74,7 +78,12 @@ impl From<Error> for std::io::Error {
         match err {
             Error::Io(e) => e,
             Error::Win32 { source, .. } => source,
-            Error::NotFound { .. } => std::io::Error::new(std::io::ErrorKind::NotFound, err),
+            // "Only a shim exists" means the launchable executable is missing: callers that
+            // check `NotFound` to mean "CLI not installed" should treat it the same way.
+            Error::NotFound { .. } | Error::ShimOnly { .. } => {
+                std::io::Error::new(std::io::ErrorKind::NotFound, err)
+            }
+            Error::NotTerminated { .. } => std::io::Error::new(std::io::ErrorKind::TimedOut, err),
             other => std::io::Error::new(std::io::ErrorKind::InvalidInput, other),
         }
     }
