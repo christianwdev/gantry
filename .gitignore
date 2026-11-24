@@ -1,0 +1,16 @@
+# Dependencies & build artifacts
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Generated protocol schemas (regenerated from local CLIs)
+docs/research/schemas/
+
+# OS & editor
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.local
