@@ -1,0 +1,36 @@
+[package]
+name = "gantry-desktop"
+description = "Gantry desktop shell (Tauri v2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+default-run = "gantry"
+
+[lib]
+name = "gantry_desktop_lib"
+
+[[bin]]
+name = "gantry"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7.6", features = [] }
+
+[dependencies]
+gantry-proc.workspace = true
+serde = { version = "1.0.229", features = ["derive"] }
+specta = { version = "=2.0.0-rc.28", features = ["derive"] }
+specta-typescript = "=0.0.15"
+tauri = { version = "2.12.7", features = ["specta"] }
+tauri-plugin-single-instance = "2.5.5"
+tauri-specta = { version = "=2.0.0-rc.29", features = ["derive", "typescript"] }
+tokio = { workspace = true, features = ["time", "io-util"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

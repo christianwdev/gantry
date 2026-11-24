@@ -1,0 +1,13 @@
+{
+  "name": "@gantry/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Generated TypeScript bindings for Gantry IPC (tauri-specta). Do not edit bindings.ts by hand.",
+  "type": "module",
+  "exports": {
+    ".": "./src/bindings.ts"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.5"
+  }
+}
