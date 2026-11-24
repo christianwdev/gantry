@@ -1,0 +1,33 @@
+[package]
+name = "gantry-proc"
+description = "Gantry's process spine: Win32 Job Object containment, CREATE_NO_WINDOW, explicit handle inheritance, real-.exe resolution."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dunce.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "io-util", "net", "sync", "time"] }
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_Environment",
+  "Win32_System_JobObjects",
+  "Win32_System_Pipes",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

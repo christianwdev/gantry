@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/christianwdev/gantry"
+publish = false
+
+[workspace.dependencies]
+gantry-proc = { path = "crates/gantry-proc" }
+
+dunce = "1.0.5"
+thiserror = "2.0"
+tokio = { version = "1.54", features = ["rt", "macros", "io-util", "net", "sync", "time"] }
+tracing = "0.1.44"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+disallowed_types = "deny"
+disallowed_methods = "deny"
+undocumented_unsafe_blocks = "warn"

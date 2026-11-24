@@ -1,0 +1,11 @@
+# Every child process in Gantry MUST go through `gantry_proc::ManagedCommand`
+# (Win32 Job Object + CREATE_NO_WINDOW + explicit handle inheritance list).
+# See docs/ARCHITECTURE.md §3.5.
+disallowed-types = [
+  { path = "std::process::Command", reason = "use gantry_proc::ManagedCommand (Job Object containment + CREATE_NO_WINDOW)" },
+  { path = "tokio::process::Command", reason = "use gantry_proc::ManagedCommand (Job Object containment + CREATE_NO_WINDOW)", allow-invalid = true },
+]
+disallowed-methods = [
+  { path = "std::process::Command::new", reason = "use gantry_proc::ManagedCommand::new" },
+  { path = "tokio::process::Command::new", reason = "use gantry_proc::ManagedCommand::new", allow-invalid = true },
+]
