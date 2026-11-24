@@ -91,18 +91,22 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         error: None,
     };
     let mut cmd = ManagedCommand::new(program);
+    // stderr is captured too: real CLIs print their errors there (console.error, eprintln),
+    // and a few print their version there.
     cmd.args(args)
         .env("DISABLE_AUTOUPDATER", "1")
-        .stdout(Stdio::Piped);
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped);
 
-    // PROBE_TIMEOUT covers everything, including resolution.
+    // These live outside `run` so a timeout (which drops `run`) doesn't lose them.
     let launched = Arc::new(Mutex::new(None::<String>));
     let launched_slot = Arc::clone(&launched);
-    // Lives outside `run`, so output collected before a timeout isn't lost with the future.
-    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let buf = Arc::clone(&output);
+    let captured = Captured::default();
+    let sinks = captured.clone();
     let exited = Arc::new(Mutex::new(None::<ExitStatus>));
     let exited_slot = Arc::clone(&exited);
+
+    // PROBE_TIMEOUT covers everything, including resolution.
     let run = async move {
         // Resolution and CreateProcess do blocking registry/filesystem work (a PATH entry on an
         // unreachable network share can stall for tens of seconds), so keep them off the async
@@ -111,56 +115,33 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
             .await
             .map_err(|e| gantry_proc::Error::Io(std::io::Error::other(e)))??;
         // Remember what actually launched, so even a timed-out probe can say which binary hung.
-        *launched_slot.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(child.program().display().to_string());
-        // Drain stdout concurrently (so a full pipe can't stall the child) into a shared
-        // buffer, but finish on the process exiting, not on EOF: a helper that inherited stdout
-        // would hold it open.
-        let sink = Arc::clone(&buf);
-        let mut stdout = child.stdout.take();
-        let mut reader = tokio::spawn(async move {
-            let Some(stdout) = stdout.as_mut() else {
-                return;
-            };
-            let mut chunk = [0u8; 8192];
-            // Stop only at EOF or on a run of errors: dropping the pipe early on a transient
-            // error would give the CLI a broken pipe before it printed its version.
-            let mut consecutive_errors = 0;
-            loop {
-                match stdout.read(&mut chunk).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        consecutive_errors = 0;
-                        let mut kept = sink.lock().unwrap_or_else(|p| p.into_inner());
-                        let room = MAX_CAPTURE.saturating_sub(kept.len());
-                        kept.extend_from_slice(&chunk[..n.min(room)]);
-                    }
-                    Err(_) if consecutive_errors < 8 => consecutive_errors += 1,
-                    Err(_) => break,
-                }
-            }
-        });
+        *lock(&launched_slot) = Some(child.program().display().to_string());
+        // Drain both streams concurrently (so a full pipe can't stall the child), but finish on
+        // the process exiting, not on EOF: a helper that inherited a stream would hold it open.
+        let readers = [
+            capture(child.stdout.take(), Arc::clone(&sinks.stdout)),
+            capture(child.stderr.take(), Arc::clone(&sinks.stderr)),
+        ];
         let exit = child.wait().await?;
-        *exited_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(exit);
+        *lock(&exited_slot) = Some(exit);
         // After exit: a launcher stub may have handed off to the real binary, which can take a
         // while (cold start, AV scan) to print. So keep waiting while nothing has been printed
-        // (bounded by PROBE_TIMEOUT); once there is output, allow READ_GRACE for the rest, then
-        // kill the tree, which closes any pipe a lingering helper holds -> EOF.
-        // READ_GRACE is measured from when output first appeared (not from the exit), so a slow
-        // binary that starts printing late still gets the full grace to finish its line. A
-        // failed exit is already the answer, so its grace starts at the exit (otherwise we'd
-        // wait out PROBE_TIMEOUT and misreport "timed out" instead of the exit code).
+        // (bounded by PROBE_TIMEOUT). READ_GRACE is measured from when output first appeared,
+        // so a binary that starts printing late still gets the full grace to finish its line;
+        // a failed exit is already the answer, so its grace starts at the exit. When the grace
+        // is up, kill the tree, which closes any pipe a lingering helper holds -> EOF.
         let mut grace_from = (!exit.success()).then(Instant::now);
-        loop {
-            if tokio::time::timeout(POLL, &mut reader).await.is_ok() {
-                break;
-            }
-            if grace_from.is_none() && has_output(&buf) {
+        while !readers.iter().all(|r| r.is_finished()) {
+            tokio::time::sleep(POLL).await;
+            if grace_from.is_none() && sinks.has_output() {
                 grace_from = Some(Instant::now());
             }
             if grace_from.is_some_and(|t| t.elapsed() >= READ_GRACE) {
                 let _ = child.kill_tree();
-                let _ = tokio::time::timeout(KILL_GRACE, &mut reader).await;
+                let deadline = Instant::now() + KILL_GRACE;
+                while !readers.iter().all(|r| r.is_finished()) && Instant::now() < deadline {
+                    tokio::time::sleep(POLL).await;
+                }
                 break;
             }
         }
@@ -168,17 +149,17 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
         let _ = child.kill_tree();
         Ok::<_, gantry_proc::Error>((exit, child.program().to_path_buf()))
     };
+
     match tokio::time::timeout(PROBE_TIMEOUT, run).await {
         Ok(Ok((exit, ran))) => {
             // Report the executable that actually ran.
             status.path = Some(ran.display().to_string());
-            let output = output.lock().unwrap_or_else(|p| p.into_inner());
             if !exit.success() {
-                status.error = Some(failure_message(program, exit, &output));
-            } else if let Some(version) = version_line(&output) {
+                status.error = Some(failure_message(program, exit, &captured));
+            } else if let Some(version) = captured.version() {
                 status.state = ToolState::Ok;
                 status.version = Some(version);
-            } else if let Some(line) = first_line(&output) {
+            } else if let Some(line) = captured.first_line() {
                 // Exit 0 but nothing version-like (e.g. only a warning banner): not verified.
                 status.error = Some(format!(
                     "`{program} --version` printed `{line}`, no version"
@@ -195,26 +176,25 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
                     status.path = Some(shim.display().to_string());
                 }
                 // Failed after launch (e.g. the wait itself failed): still say what ran.
-                _ => status.path = launched.lock().unwrap_or_else(|p| p.into_inner()).take(),
+                _ => status.path = lock(&launched).take(),
             }
             status.error = Some(e.to_string());
         }
         // Dropping the child (and its job) inside `run` killed the probe's process tree.
         Err(_) => {
-            status.path = launched.lock().unwrap_or_else(|p| p.into_inner()).take();
-            let output = output.lock().unwrap_or_else(|p| p.into_inner());
-            let exit = *exited.lock().unwrap_or_else(|p| p.into_inner());
+            status.path = lock(&launched).take();
+            let exit = *lock(&exited);
             let secs = PROBE_TIMEOUT.as_secs();
-            // Whether the probed process itself exited (only a leftover held stdout open).
+            // Whether the probed process itself exited (only a leftover held a stream open).
             let exited_ok = exit.is_some_and(|e| e.success());
             let lingered = if exited_ok {
                 format!("a leftover process kept its output open past {secs}s")
             } else {
                 format!("it did not exit within {secs}s")
             };
-            status.error = Some(match (exit, version_line(&output), first_line(&output)) {
+            status.error = Some(match (exit, captured.version(), captured.first_line()) {
                 // The process already failed; the timeout only hit while draining leftovers.
-                (Some(e), _, _) if !e.success() => failure_message(program, e, &output),
+                (Some(e), _, _) if !e.success() => failure_message(program, e, &captured),
                 // It answered but then hung (e.g. a slow update check): usable, but say so.
                 (_, Some(version), _) => {
                     status.state = ToolState::Ok;
@@ -237,16 +217,85 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
     status
 }
 
-/// Only this much stdout is kept from a probe (the version is on the first lines); the rest is
-/// still drained so the CLI never blocks on a full pipe.
+/// Only this much of each stream is kept from a probe (the version is on the first lines); the
+/// rest is still drained so the CLI never blocks on a full pipe.
 const MAX_CAPTURE: usize = 64 * 1024;
 
-/// The first line that [`looks_like_version`], trimmed.
+/// A probe's captured stdout and stderr (each bounded by [`MAX_CAPTURE`]).
+#[derive(Clone, Default)]
+struct Captured {
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Captured {
+    /// The version line: preferably from stdout, else from stderr (some CLIs print it there).
+    fn version(&self) -> Option<String> {
+        version_line(&lock(&self.stdout)).or_else(|| version_line(&lock(&self.stderr)))
+    }
+
+    /// The first non-empty line, preferring stdout; usually the reason for a failure.
+    fn first_line(&self) -> Option<String> {
+        first_line(&lock(&self.stdout)).or_else(|| first_line(&lock(&self.stderr)))
+    }
+
+    /// Whether anything other than whitespace has been printed on either stream yet.
+    fn has_output(&self) -> bool {
+        let printed = |b: &Mutex<Vec<u8>>| lock(b).iter().any(|c| !c.is_ascii_whitespace());
+        printed(&self.stdout) || printed(&self.stderr)
+    }
+}
+
+/// Drains `stream` into `sink` (keeping at most [`MAX_CAPTURE`] bytes) until EOF.
+fn capture<R>(stream: Option<R>, sink: Arc<Mutex<Vec<u8>>>) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let Some(mut stream) = stream else {
+            return;
+        };
+        let mut chunk = [0u8; 8192];
+        // Stop only at EOF or on a run of errors: dropping the pipe early on a transient error
+        // would give the CLI a broken pipe before it printed its version.
+        let mut consecutive_errors = 0;
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    consecutive_errors = 0;
+                    let mut kept = lock(&sink);
+                    let room = MAX_CAPTURE.saturating_sub(kept.len());
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                }
+                Err(_) if consecutive_errors < 8 => consecutive_errors += 1,
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Lines starting with these (case-insensitive) are diagnostics, not the version, even if
+/// they contain a version number (`Warning: Node.js v18.0.0 is deprecated`).
+const DIAGNOSTIC_PREFIXES: &[&str] = &[
+    "warning", "warn", "error", "err!", "deprecat", "note", "notice", "info", "debug", "update",
+    "(node:",
+];
+
+/// The first line that [`looks_like_version`] and isn't a diagnostic, trimmed.
 fn version_line(bytes: &[u8]) -> Option<String> {
-    String::from_utf8_lossy(bytes)
-        .lines()
+    let text = String::from_utf8_lossy(bytes);
+    let is_diagnostic = |l: &str| {
+        let lower = l.to_ascii_lowercase();
+        DIAGNOSTIC_PREFIXES.iter().any(|p| lower.starts_with(p))
+    };
+    text.lines()
         .map(str::trim)
-        .find(|l| looks_like_version(l))
+        .find(|l| looks_like_version(l) && !is_diagnostic(l))
         .map(str::to_owned)
 }
 
@@ -260,20 +309,15 @@ fn looks_like_version(line: &str) -> bool {
         .any(|w| w[0].is_ascii_digit() && w[1] == b'.' && w[2].is_ascii_digit())
 }
 
-/// "`x --version` failed: <exit>", plus the CLI's own first line of output (usually the reason).
-fn failure_message(program: &str, exit: ExitStatus, output: &[u8]) -> String {
-    match first_line(output) {
+/// "`x --version` failed: <exit>", plus the CLI's own first line of output (usually the reason,
+/// typically from stderr).
+fn failure_message(program: &str, exit: ExitStatus, captured: &Captured) -> String {
+    let reason =
+        first_line(&lock(&captured.stderr)).or_else(|| first_line(&lock(&captured.stdout)));
+    match reason {
         Some(line) => format!("`{program} --version` failed: {exit}: {line}"),
         None => format!("`{program} --version` failed: {exit}"),
     }
-}
-
-/// Whether anything other than whitespace has been printed yet.
-fn has_output(buf: &Mutex<Vec<u8>>) -> bool {
-    buf.lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .any(|b| !b.is_ascii_whitespace())
 }
 
 /// The first non-empty line of `bytes` (lossy UTF-8), trimmed.
@@ -359,6 +403,29 @@ mod tests {
         let status = super::probe("OnlyBanner", "node", &["-e", script]).await;
         assert_eq!(status.state, super::ToolState::Failed, "{status:?}");
         assert!(status.error.unwrap().contains("could not update PATH"));
+    }
+
+    /// Review fix: real CLIs print errors to stderr; the reason must still be reported.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_exit_reports_the_reason_printed_to_stderr() {
+        let script = "console.error('Error: Node.js 18 or newer is required'); process.exit(1);";
+        let status = super::probe("StderrFail", "node", &["-e", script]).await;
+        assert_eq!(status.state, super::ToolState::Failed, "{status:?}");
+        let err = status.error.unwrap();
+        assert!(err.contains("Node.js 18 or newer is required"), "{err}");
+    }
+
+    /// Review fix: a warning that contains a version number is not the version.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn versioned_warning_is_skipped() {
+        let script = "console.log('Warning: Node.js v18.0.0 is deprecated'); \
+            console.log('codex-cli 0.171.0');";
+        let status = super::probe("VersionedWarning", "node", &["-e", script]).await;
+        assert_eq!(
+            status.version.as_deref(),
+            Some("codex-cli 0.171.0"),
+            "{status:?}"
+        );
     }
 
     /// Review fix: a failing `--version` reports the CLI's own reason, not just the code.

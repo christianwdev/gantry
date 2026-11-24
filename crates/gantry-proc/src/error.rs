@@ -21,6 +21,14 @@ pub enum Error {
     )]
     DriveRelativePath { path: PathBuf },
 
+    /// A relative program path was given without `current_dir`; it would otherwise resolve
+    /// against Gantry's own arbitrary working directory.
+    #[error(
+        "relative program path `{}` needs current_dir (or use an absolute path)",
+        path.display()
+    )]
+    RelativeWithoutCwd { path: PathBuf },
+
     /// An explicit path to a non-executable file type (e.g. `.cmd`, `.bat`, `.ps1`) was given.
     #[error("refusing to launch `{}`: only .exe/.com files may be spawned", path.display())]
     UnsupportedExecutable { path: PathBuf },

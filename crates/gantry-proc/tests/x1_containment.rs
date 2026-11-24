@@ -469,7 +469,8 @@ async fn shutdown_of_one_group_member_spares_its_siblings() {
     let status = victim
         .shutdown(Duration::from_millis(50), Duration::from_millis(150))
         .await
-        .unwrap();
+        .unwrap()
+        .status;
     assert_eq!(status.code(), 1);
     assert_eq!(
         watched.survivors_after(Duration::from_secs(5)),
@@ -513,7 +514,8 @@ async fn shutdown_closes_stdin_owned_by_writer_task() {
     let status = child
         .shutdown(Duration::from_millis(100), Duration::from_secs(10))
         .await
-        .unwrap();
+        .unwrap()
+        .status;
     assert!(
         status.success(),
         "echo should exit cleanly on EOF, got {status}"
@@ -580,13 +582,18 @@ async fn clean_shutdown_still_reaps_the_agents_helpers() {
     };
     let watched = Watched::open([helper]);
 
-    let status = child
+    let outcome = child
         .shutdown(Duration::from_millis(50), Duration::from_secs(10))
         .await
         .unwrap();
+    let status = outcome.status;
     assert!(
         status.success(),
         "main process should exit cleanly on EOF: {status}"
+    );
+    assert!(
+        outcome.tree_empty,
+        "shutdown must report the reaped tree as empty"
     );
     assert_eq!(
         watched.survivors_after(Duration::from_secs(2)),
@@ -607,7 +614,8 @@ async fn shutdown_ladder_prefers_eof_then_kills() {
     let status = echo
         .shutdown(Duration::from_millis(200), Duration::from_secs(5))
         .await
-        .unwrap();
+        .unwrap()
+        .status;
     assert!(status.success());
     assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
 
@@ -621,7 +629,8 @@ async fn shutdown_ladder_prefers_eof_then_kills() {
     let status = sleeper
         .shutdown(Duration::from_millis(100), Duration::from_millis(300))
         .await
-        .unwrap();
+        .unwrap()
+        .status;
     assert_eq!(status.code(), 1);
     assert!(t.elapsed() >= Duration::from_millis(300));
 }

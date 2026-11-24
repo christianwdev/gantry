@@ -384,6 +384,16 @@ impl Drop for AttributeList<'_> {
     }
 }
 
+/// Outcome of [`ManagedChild::shutdown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shutdown {
+    /// Exit status of the main process.
+    pub status: ExitStatus,
+    /// Whether the child's whole job (all descendants) was confirmed empty afterwards. `false`
+    /// means leftovers may still hold files or ports open.
+    pub tree_empty: bool,
+}
+
 /// A process's exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExitStatus(u32);
@@ -609,11 +619,15 @@ impl ManagedChild {
     /// 3. terminate this child's own job (its whole tree, never group siblings) and wait;
     /// 4. in every case, once the main process is gone, reap any descendants still alive in its
     ///    job and wait (up to a few seconds) for the job to empty.
+    ///
+    /// The main process's exit status is the result. Whether its *tree* is gone is reported
+    /// separately in [`Shutdown::tree_empty`]: callers about to delete files the tree may hold
+    /// (e.g. `git worktree remove`) must check it rather than assume.
     pub async fn shutdown(
         &mut self,
         eof_after: Duration,
         kill_after: Duration,
-    ) -> Result<ExitStatus> {
+    ) -> Result<Shutdown> {
         let result = self.stop_main_process(eof_after, kill_after).await;
         if let Err(e) = &result {
             // A wait failed mid-ladder (e.g. handle/thread-pool exhaustion): never return with
@@ -624,27 +638,33 @@ impl ManagedChild {
             }
         }
         // The main process is gone, but helpers it started (MCP servers, dev servers) may still
-        // run in its job, holding ports and files (which would block `git worktree remove`).
-        // A finished shutdown means the whole tree is gone.
-        // Reaping is best-effort: the main process's exit status is the result, and a reap
-        // failure must not turn a clean shutdown into an error (the job still kills the rest
-        // when its last handle closes).
-        if self.job.active_processes().unwrap_or(1) > 0 {
-            tracing::debug!(
-                pid = self.pid,
-                "shutdown ladder: reaping leftover descendants"
-            );
-            let reaped = match self.kill_tree() {
-                Ok(()) => self.job.wait_until_empty(REAP_TIMEOUT).await,
-                Err(e) => Err(e),
-            };
-            match reaped {
-                Ok(true) => {}
-                Ok(false) => tracing::warn!(pid = self.pid, "descendants alive after reaping"),
-                Err(e) => tracing::warn!(pid = self.pid, error = %e, "failed to reap descendants"),
+        // run in its job, holding ports and files. Reap them; a reap failure doesn't turn the
+        // main process's result into an error, but it is reported via `tree_empty`.
+        let tree_empty = match self.job.active_processes() {
+            Ok(0) => true,
+            _ => {
+                tracing::debug!(
+                    pid = self.pid,
+                    "shutdown ladder: reaping leftover descendants"
+                );
+                let reaped = match self.kill_tree() {
+                    Ok(()) => self.job.wait_until_empty(REAP_TIMEOUT).await,
+                    Err(e) => Err(e),
+                };
+                match reaped {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        tracing::warn!(pid = self.pid, "descendants alive after reaping");
+                        false
+                    }
+                    Err(e) => {
+                        tracing::warn!(pid = self.pid, error = %e, "failed to reap descendants");
+                        false
+                    }
+                }
             }
-        }
-        result
+        };
+        result.map(|status| Shutdown { status, tree_empty })
     }
 
     async fn stop_main_process(

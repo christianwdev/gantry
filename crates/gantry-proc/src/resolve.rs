@@ -267,6 +267,14 @@ pub fn find_executable(
         }
         let full = match cwd {
             Some(dir) if as_path.is_relative() => dir.join(as_path),
+            // Without a cwd a relative program path would resolve against Gantry's own
+            // (arbitrary) working directory — the same planted-exe risk as relative PATH
+            // entries. Require an explicit base.
+            None if as_path.is_relative() => {
+                return Err(Error::RelativeWithoutCwd {
+                    path: as_path.to_path_buf(),
+                });
+            }
             _ => as_path.to_path_buf(),
         };
         return check_explicit(full);
@@ -423,6 +431,20 @@ mod tests {
             "{err:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn relative_program_paths_need_a_cwd() {
+        let err = find_executable(OsStr::new(r"bin\tool.exe"), OsStr::new(""), None).unwrap_err();
+        assert!(matches!(err, Error::RelativeWithoutCwd { .. }), "{err:?}");
+        // With a cwd it is resolved against it (and here simply not found).
+        let err = find_executable(
+            OsStr::new(r"bin\tool.exe"),
+            OsStr::new(""),
+            Some(&std::env::temp_dir()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::NotFound { .. }), "{err:?}");
     }
 
     #[test]

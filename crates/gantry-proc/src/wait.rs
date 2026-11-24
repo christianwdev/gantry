@@ -34,9 +34,15 @@ impl Drop for Registration {
         // SAFETY: `wait` came from RegisterWaitForSingleObject. INVALID_HANDLE_VALUE makes this
         // block until any in-flight callback has returned, after which `ctx` is unreachable
         // from the pool and can be freed.
-        unsafe {
-            UnregisterWaitEx(self.wait, INVALID_HANDLE_VALUE);
-            drop(Box::from_raw(self.ctx));
+        let unregistered = unsafe { UnregisterWaitEx(self.wait, INVALID_HANDLE_VALUE) } != 0;
+        if unregistered {
+            // SAFETY: the wait is gone and no callback can still be running, so we are the
+            // only owner of `ctx`.
+            drop(unsafe { Box::from_raw(self.ctx) });
+        } else {
+            // The pool may still hold `ctx` (and could still run the callback): freeing it
+            // would be a use-after-free. Leak the few bytes instead.
+            tracing::error!(error = %std::io::Error::last_os_error(), "UnregisterWaitEx failed");
         }
     }
 }
