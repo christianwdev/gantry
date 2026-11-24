@@ -1,6 +1,8 @@
-import { Suspense, use } from "react";
+import { Suspense, use, useState } from "react";
 
 import { commands } from "@gantry/protocol";
+
+import { LoadError } from "./LoadError";
 
 type ToolStatus = Awaited<ReturnType<typeof commands.toolHealth>>[number];
 const STATE_LABEL: Record<ToolStatus["state"], string> = {
@@ -12,7 +14,8 @@ const STATE_LABEL: Record<ToolStatus["state"], string> = {
 
 type ToolsResult = { ok: true; tools: ToolStatus[] } | { ok: false; error: string };
 
-// Probed once per app session; a "re-check" action can come with the real health system.
+// Probed once per app session. A failure stays cached (React re-reads the same promise after it
+// settles) until Retry clears it.
 let toolsRequest: Promise<ToolsResult> | undefined;
 
 function loadTools(): Promise<ToolsResult> {
@@ -23,11 +26,11 @@ function loadTools(): Promise<ToolsResult> {
   return toolsRequest;
 }
 
-function ToolList() {
+function ToolList({ onRetry }: { onRetry: () => void }) {
   const result = use(loadTools());
 
   if (!result.ok) {
-    return <p className="error">Could not probe tools: {result.error}</p>;
+    return <LoadError message={`Could not probe tools: ${result.error}`} onRetry={onRetry} />;
   }
 
   return (
@@ -50,13 +53,18 @@ function ToolList() {
 }
 
 export function ToolsPanel() {
+  const [attempt, setAttempt] = useState(0);
+  const retry = () => {
+    toolsRequest = undefined;
+    setAttempt((n) => n + 1);
+  };
   return (
     <section className="panel" aria-labelledby="tools-heading">
       <h2 id="tools-heading" className="panel-title">
         Agent CLIs
       </h2>
       <Suspense fallback={<p className="placeholder">Probing…</p>}>
-        <ToolList />
+        <ToolList key={attempt} onRetry={retry} />
       </Suspense>
     </section>
   );

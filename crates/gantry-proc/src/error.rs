@@ -4,8 +4,8 @@ use std::path::PathBuf;
 /// Errors produced by the process spine.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The program could not be found on the search path.
-    #[error("executable `{}` not found on PATH", program.display())]
+    /// The program could not be found (on the search path, or at the explicit path given).
+    #[error("executable `{}` not found", program.display())]
     NotFound { program: OsString },
 
     /// Only a script shim (`.cmd`, `.bat`, `.ps1`) was found. Gantry never launches through

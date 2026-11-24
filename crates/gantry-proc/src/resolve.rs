@@ -20,9 +20,11 @@ use windows_sys::Win32::System::Registry::{
     RegGetValueW,
 };
 
+use crate::cmdline::env_key_cmp;
 use crate::{Error, Result};
 
-const EXECUTABLE_EXTS: [&str; 2] = ["exe", "com"];
+/// Search order within one directory, matching the default `PATHEXT` (`.COM;.EXE;...`).
+const EXECUTABLE_EXTS: [&str; 2] = ["com", "exe"];
 const SHIM_EXTS: [&str; 4] = ["cmd", "bat", "ps1", "vbs"];
 
 /// Returns the process `PATH` with any registry `PATH` entries it is missing appended
@@ -44,15 +46,18 @@ pub fn merged_path() -> OsString {
 /// Joins `;`-separated path lists, dropping empty and duplicate entries (case-insensitive,
 /// ignoring trailing separators) while preserving first-seen order.
 pub fn merge_path_lists(lists: &[OsString]) -> OsString {
-    let mut seen: Vec<String> = Vec::new();
+    // Keys are the raw UTF-16 without trailing separators, compared with the OS's ordinal
+    // case-insensitive rules (no lossy conversion, so distinct directories never collide).
+    let mut seen: Vec<OsString> = Vec::new();
     let mut out: Vec<OsString> = Vec::new();
     for list in lists {
         for entry in split_path_list(list) {
-            let key = entry
-                .to_string_lossy()
-                .trim_end_matches(['\\', '/'])
-                .to_lowercase();
-            if !seen.contains(&key) {
+            let mut wide: Vec<u16> = entry.encode_wide().collect();
+            while wide.len() > 1 && matches!(wide.last(), Some(&0x5C | &0x2F)) {
+                wide.pop();
+            }
+            let key = OsString::from_wide(&wide);
+            if !seen.iter().any(|k| env_key_cmp(k, &key).is_eq()) {
                 seen.push(key);
                 out.push(entry);
             }
@@ -166,8 +171,8 @@ pub(crate) fn wide_nul(s: &OsStr) -> Vec<u16> {
 ///   executable; an extension-less path tries `.exe`.
 /// * Bare names are searched only in the absolute directories of `search_path` (never the
 ///   current directory, and relative PATH entries are skipped). A bare name without an
-///   extension tries `.exe` then `.com` in each directory. Script extensions (`.cmd`, `.bat`,
-///   `.ps1`, `.vbs`) are always refused.
+///   extension tries `.com` then `.exe` in each directory (default `PATHEXT` order). Script
+///   extensions (`.cmd`, `.bat`, `.ps1`, `.vbs`) are always refused.
 pub fn find_executable(
     program: &OsStr,
     search_path: &OsStr,
@@ -383,6 +388,40 @@ mod tests {
         let merged = merge_path_lists(&[list]);
         assert_eq!(merged, OsString::from(r#"C:\a;"C:\Tools;v2\bin";C:\b"#));
         assert_eq!(split_path_list(&merged).count(), 3);
+    }
+
+    #[test]
+    fn com_wins_over_exe_like_pathext() {
+        let dir = std::env::temp_dir().join(format!("gantry-proc-com-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(system32().join("cmd.exe"), dir.join("tool.exe")).unwrap();
+        std::fs::copy(system32().join("cmd.exe"), dir.join("tool.com")).unwrap();
+        let found = find_executable(OsStr::new("tool"), dir.as_os_str(), None);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(found.unwrap().extension().unwrap(), "com");
+    }
+
+    #[test]
+    fn dedupe_is_lossless_and_unicode_case_insensitive() {
+        let mut a: Vec<u16> = r"C:\x\".encode_utf16().collect();
+        a.push(0xD800);
+        let mut b: Vec<u16> = r"C:\x\".encode_utf16().collect();
+        b.push(0xDC00);
+        let merged = merge_path_lists(&[
+            OsString::from_wide(&a),
+            OsString::from_wide(&b),
+            OsString::from(r"C:\Äpfel"),
+            OsString::from(r"c:\äpfel\"),
+        ]);
+        let parts: Vec<OsString> = split_path_list(&merged).collect();
+        assert_eq!(
+            parts,
+            vec![
+                OsString::from_wide(&a),
+                OsString::from_wide(&b),
+                OsString::from(r"C:\Äpfel"),
+            ]
+        );
     }
 
     #[test]

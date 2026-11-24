@@ -561,7 +561,9 @@ impl ManagedChild {
         if unsafe { TerminateProcess(self.raw(), 1) } == 0 {
             // Capture before try_wait's own Win32 calls overwrite the thread's last error.
             let err = Error::last_os("TerminateProcess");
-            if self.try_wait()?.is_none() {
+            // Only an already-exited process excuses the failure; report the original error
+            // even if this follow-up query fails too.
+            if !matches!(self.try_wait(), Ok(Some(_))) {
                 return Err(err);
             }
         }
@@ -598,7 +600,11 @@ impl ManagedChild {
             return Ok(status);
         }
         tracing::warn!(pid = self.pid, "shutdown ladder: terminating process tree");
-        self.kill_tree()?;
+        if let Err(tree_err) = self.kill_tree() {
+            // Never give up with the agent still alive: fall back to the process itself.
+            tracing::error!(pid = self.pid, error = %tree_err, "TerminateJobObject failed");
+            self.kill().map_err(|_| tree_err)?;
+        }
         self.wait().await
     }
 }

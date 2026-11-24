@@ -12,8 +12,11 @@ use specta::Type;
 use tokio::io::AsyncReadExt;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
-/// How long to keep reading stdout after the probed process has exited.
+/// How long leftover processes may keep stdout open after the probed process exits before
+/// the probe kills its tree (covers launcher stubs whose real binary prints the version).
 const READ_GRACE: Duration = Duration::from_secs(2);
+/// How long to finish reading after killing the probe's tree.
+const KILL_GRACE: Duration = Duration::from_secs(1);
 
 /// CLIs probed on startup: (display name, program, version args).
 const TOOLS: &[(&str, &str, &[&str])] = &[
@@ -118,14 +121,23 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
             out
         });
         let exit = child.wait().await?;
-        // A --version probe needs no survivors; killing them closes the pipe so the reader
-        // gets everything already written, then EOF.
+        // Give leftover processes a grace period first: a launcher stub may exit before the
+        // real binary it started has printed the version. Only if stdout is still open after
+        // that (a helper holding it) kill the tree, which closes the pipe -> EOF.
+        let mut reader = reader;
+        let out = match tokio::time::timeout(READ_GRACE, &mut reader).await {
+            Ok(joined) => joined.unwrap_or_default(),
+            Err(_) => {
+                let _ = child.kill_tree();
+                tokio::time::timeout(KILL_GRACE, reader)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default()
+            }
+        };
+        // Don't leave detached helpers running after a probe.
         let _ = child.kill_tree();
-        let out = tokio::time::timeout(READ_GRACE, reader)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
         let out = String::from_utf8_lossy(&out).into_owned();
         Ok::<_, gantry_proc::Error>((exit, out, child.program().to_path_buf()))
     };
@@ -160,12 +172,28 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
 mod tests {
     use std::time::Instant;
 
+    // Note: these Node helpers must be `detached: true`. libuv puts non-detached children in
+    // its own kill-on-close job, so they would die with the parent and not model a real
+    // surviving helper/launcher at all (verified empirically).
+
+    /// Review fix: a launcher stub that starts the real binary and exits immediately must not
+    /// have the real binary killed before it prints the version.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_waits_for_output_from_a_launcher_stubs_real_binary() {
+        let script = "require('child_process').spawn(process.execPath, \
+            ['-e', 'setTimeout(() => console.log(\"v1.2.3\"), 300)'], \
+            { stdio: ['ignore', 'inherit', 'ignore'], detached: true }).unref();";
+        let status = super::probe("Launcher", "node", &["-e", script]).await;
+        assert_eq!(status.state, super::ToolState::Ok, "{status:?}");
+        assert_eq!(status.version.as_deref(), Some("v1.2.3"));
+    }
+
     /// Review fix: a CLI that prints its version and exits while a helper it spawned keeps
     /// stdout open must not be reported as "timed out".
     #[tokio::test(flavor = "multi_thread")]
     async fn probe_finishes_on_exit_even_if_a_helper_holds_stdout() {
         let script = "require('child_process').spawn(process.execPath, \
-            ['-e', 'setTimeout(() => {}, 30000)'], { stdio: ['ignore', 'inherit', 'ignore'] }).unref(); \
+            ['-e', 'setTimeout(() => {}, 30000)'], { stdio: ['ignore', 'inherit', 'ignore'], detached: true }).unref(); \
             console.log('v9.9.9');";
         let t = Instant::now();
         let status = super::probe("Helper", "node", &["-e", script]).await;
