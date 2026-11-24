@@ -278,6 +278,7 @@ impl ManagedCommand {
             program,
             process,
             job,
+            _group: self.job.clone(),
             status: None,
             stdin_close: None,
             stdin: stdin_parent.map(ChildStdin),
@@ -415,6 +416,10 @@ pub struct ManagedChild {
     program: PathBuf,
     process: OwnedHandle,
     job: Arc<Job>,
+    /// Keeps the group job (if any) open while this child lives: the group is kill-on-close
+    /// and this child's job is nested under it, so letting the caller's last group handle drop
+    /// would otherwise kill the child immediately.
+    _group: Option<Arc<Job>>,
     status: Option<ExitStatus>,
     stdin_close: Option<(oneshot::Sender<()>, Arc<AtomicBool>)>,
     /// Raw stdin. Prefer [`ManagedChild::stdin_writer`]: if you `take()` this, the shutdown

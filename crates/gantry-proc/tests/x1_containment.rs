@@ -522,6 +522,31 @@ async fn shutdown_closes_stdin_owned_by_writer_task() {
     assert!(writer.send_line("too late").await.is_err());
 }
 
+/// Review fix: dropping every caller-side reference to a group job must not kill a child
+/// spawned into it (the child's nested job would die with its kill-on-close parent).
+#[tokio::test(flavor = "multi_thread")]
+async fn child_outlives_callers_group_handle() {
+    let mut child = ManagedCommand::new(FIXTURE)
+        .arg("sleep")
+        .job(Arc::new(Job::new().unwrap())) // temporary: the command is dropped right away
+        .spawn()
+        .unwrap();
+    let watched = Watched::open([child.id()]);
+    assert_eq!(
+        child
+            .wait_timeout(Duration::from_millis(500))
+            .await
+            .unwrap(),
+        None,
+        "child died when the caller's group handle was dropped"
+    );
+    drop(child); // its own job + the group ref go away -> killed
+    assert_eq!(
+        watched.survivors_after(Duration::from_secs(5)),
+        Vec::<u32>::new()
+    );
+}
+
 /// Review fix: a send issued right after close_stdin() must fail, not be silently dropped.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_after_close_stdin_fails_immediately() {

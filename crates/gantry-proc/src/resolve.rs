@@ -30,8 +30,8 @@ const SHIM_EXTS: [&str; 4] = ["cmd", "bat", "ps1", "vbs"];
 /// (machine entries first, then user entries — the order Windows itself composes them).
 pub fn merged_path() -> OsString {
     let process = std::env::var_os("PATH").unwrap_or_default();
-    let machine = registry_path(HKEY_LOCAL_MACHINE, MACHINE_ENV);
-    let user = registry_path(HKEY_CURRENT_USER, USER_ENV);
+    let machine = registry_path(HKEY_LOCAL_MACHINE, MACHINE_ENV, None);
+    let user = registry_path(HKEY_CURRENT_USER, USER_ENV, machine.as_deref());
     merge_path_lists(&[
         process,
         machine.unwrap_or_default(),
@@ -115,12 +115,12 @@ fn split_path_list(list: &OsStr) -> impl Iterator<Item = OsString> + '_ {
 const MACHINE_ENV: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
 const USER_ENV: &str = "Environment";
 
-/// Reads a `REG_SZ`/`REG_EXPAND_SZ` value *unexpanded* (no trailing NUL).
 /// A string read from the registry or environment, and whether it may contain `%VAR%`
 /// references to expand (only `REG_EXPAND_SZ` does; `REG_SZ` and already-expanded process
 /// environment values are literal, as Windows treats them).
 type VarValue = (Vec<u16>, bool);
 
+/// Reads a `REG_SZ`/`REG_EXPAND_SZ` value *unexpanded* (no trailing NUL).
 fn registry_value(root: HKEY, subkey: &str, name: &OsStr) -> Option<VarValue> {
     let subkey = wide_nul(OsStr::new(subkey));
     let value = wide_nul(name);
@@ -171,20 +171,31 @@ fn registry_value(root: HKEY, subkey: &str, name: &OsStr) -> Option<VarValue> {
 ///
 /// Only `REG_EXPAND_SZ` values are expanded (recursively); `REG_SZ` values and process
 /// environment values are used literally, as Windows does.
-fn registry_path(root: HKEY, subkey: &str) -> Option<OsString> {
+///
+/// `%PATH%` inside a `Path` value refers to the *previous* PATH, not to the value itself (some
+/// installers write a user Path of `%PATH%;C:\tools`): it resolves to `prior` (the expanded
+/// machine Path when expanding the user Path), and stays literal when there is none.
+fn registry_path(root: HKEY, subkey: &str, prior: Option<&OsStr>) -> Option<OsString> {
     let (raw, expandable) = registry_value(root, subkey, OsStr::new("Path"))?;
     if !expandable {
         return Some(OsString::from_wide(&raw));
     }
-    let is_user = root == HKEY_CURRENT_USER;
-    let lookup = |name: &OsStr| {
+    let lookup = env_lookup(root == HKEY_CURRENT_USER, prior);
+    Some(OsString::from_wide(&expand_vars(&raw, &lookup, 4)))
+}
+
+/// The variable lookup used when expanding a registry `Path` (see [`registry_path`]).
+fn env_lookup(is_user: bool, prior: Option<&OsStr>) -> impl Fn(&OsStr) -> Option<VarValue> + '_ {
+    move |name: &OsStr| {
+        if name.eq_ignore_ascii_case("PATH") {
+            return prior.map(|p| (p.encode_wide().collect(), false));
+        }
         is_user
             .then(|| registry_value(HKEY_CURRENT_USER, USER_ENV, name))
             .flatten()
             .or_else(|| registry_value(HKEY_LOCAL_MACHINE, MACHINE_ENV, name))
             .or_else(|| std::env::var_os(name).map(|v| (v.encode_wide().collect(), false)))
-    };
-    Some(OsString::from_wide(&expand_vars(&raw, &lookup, 4)))
+    }
 }
 
 /// Expands `%NAME%` references using `lookup`, recursing up to `depth` levels into values that
@@ -611,6 +622,20 @@ mod tests {
         );
         // Self-reference terminates (depth-limited) instead of recursing forever.
         assert_eq!(expand("%LOOP%", &vars), "%LOOP%");
+    }
+
+    #[test]
+    fn user_path_self_reference_means_the_machine_path() {
+        let machine = OsStr::new(r"C:\Windows\System32;C:\m");
+        let user_raw: Vec<u16> = r"%PATH%;C:\tools".encode_utf16().collect();
+        let expanded = expand_vars(&user_raw, &env_lookup(true, Some(machine)), 4);
+        assert_eq!(
+            String::from_utf16(&expanded).unwrap(),
+            r"C:\Windows\System32;C:\m;C:\tools"
+        );
+        // Without a prior PATH (machine Path itself), %PATH% stays literal (then skipped).
+        let expanded = expand_vars(&user_raw, &env_lookup(false, None), 4);
+        assert_eq!(String::from_utf16(&expanded).unwrap(), r"%PATH%;C:\tools");
     }
 
     #[test]

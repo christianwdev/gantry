@@ -175,7 +175,7 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
             // Report the executable that actually ran.
             status.path = Some(ran.display().to_string());
             if !exit.success() {
-                status.error = Some(format!("`{program} --version` failed: {exit}"));
+                status.error = Some(failure_message(program, exit, &output));
             } else if let Some(line) = out.lines().map(str::trim).find(|l| !l.is_empty()) {
                 status.state = ToolState::Ok;
                 status.version = Some(line.to_owned());
@@ -202,6 +202,10 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
             let exit = *exited.lock().unwrap_or_else(|p| p.into_inner());
             let secs = PROBE_TIMEOUT.as_secs();
             status.error = Some(match printed {
+                // The process already failed; the timeout only hit while draining leftovers.
+                _ if exit.is_some_and(|e| !e.success()) => {
+                    failure_message(program, exit.expect("checked"), &output)
+                }
                 // It answered but then hung (e.g. a slow update check): usable, but say so.
                 Some(line) if looks_like_version(&line) => {
                     status.state = ToolState::Ok;
@@ -224,10 +228,22 @@ async fn probe(name: &str, program: &str, args: &[&str]) -> ToolStatus {
 }
 
 /// Whether a line printed by `--version` plausibly is one (CLIs print e.g. `2.1.330 (Claude
-/// Code)`, `codex-cli 0.171.0`, `v24.18.1`, `git version 2.45.2`): it contains a digit.
-/// Guards against reporting an error banner as a healthy tool's version.
+/// Code)`, `codex-cli 0.171.0`, `v24.18.1`, `git version 2.45.2`): it contains a dotted number
+/// (`<digit>.<digit>`). Guards against reporting an error banner as a healthy tool's version —
+/// a bare digit is not enough (`Error: Node.js 18 or newer is required`).
 fn looks_like_version(line: &str) -> bool {
-    line.bytes().any(|b| b.is_ascii_digit())
+    line.as_bytes()
+        .windows(3)
+        .any(|w| w[0].is_ascii_digit() && w[1] == b'.' && w[2].is_ascii_digit())
+}
+
+/// "`x --version` failed: <exit>", plus the CLI's own first line of output (usually the reason).
+fn failure_message(program: &str, exit: ExitStatus, output: &Mutex<Vec<u8>>) -> String {
+    let printed = first_line(&output.lock().unwrap_or_else(|p| p.into_inner()));
+    match printed {
+        Some(line) => format!("`{program} --version` failed: {exit}: {line}"),
+        None => format!("`{program} --version` failed: {exit}"),
+    }
 }
 
 /// Whether anything other than whitespace has been printed yet.
@@ -299,6 +315,22 @@ mod tests {
             assert!(super::looks_like_version(v), "{v}");
         }
         assert!(!super::looks_like_version("Error: failed to load config"));
+        assert!(!super::looks_like_version(
+            "Error: Node.js 18 or newer is required"
+        ));
+    }
+
+    /// Review fix: a failing `--version` reports the CLI's own reason, not just the code.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_exit_includes_the_clis_message() {
+        let script = "console.log('Error: invalid settings.json'); process.exit(3);";
+        let status = super::probe("Fails", "node", &["-e", script]).await;
+        assert_eq!(status.state, super::ToolState::Failed, "{status:?}");
+        let err = status.error.unwrap();
+        assert!(
+            err.contains("exit code 3") && err.contains("invalid settings.json"),
+            "{err}"
+        );
     }
 
     /// Review fix: a CLI that prints its version and then hangs keeps its version.
