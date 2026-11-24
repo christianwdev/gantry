@@ -242,11 +242,18 @@ impl Events {
         }
     }
 
+    /// Waits for `SessionTerminated`, then checks the stream really ends (no sender outlives
+    /// termination, even while the session handle is still alive).
     pub async fn terminated(&mut self) {
         self.until("SessionTerminated", |e| {
             matches!(e, ProviderEvent::SessionTerminated { .. })
         })
         .await;
+        match tokio::time::timeout(Duration::from_secs(5), self.rx.recv()).await {
+            Ok(None) => {}
+            Ok(Some(e)) => panic!("event after SessionTerminated: {e:?}"),
+            Err(_) => panic!("event stream did not end after SessionTerminated"),
+        }
     }
 
     pub fn count(&self, pred: impl Fn(&ProviderEvent) -> bool) -> usize {

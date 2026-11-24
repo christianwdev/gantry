@@ -311,9 +311,19 @@ pub async fn live_config(h: &Harness) {
         _ => unreachable!(),
     }
     assert_eq!(events.turn_completed().await.0, TurnStatus::Completed);
+    // Back to Manual mid-session: the CLI accepts `manual` and reports it as `default`.
+    session
+        .set_permission_mode(PermissionMode::Manual)
+        .await
+        .unwrap();
+    events
+        .until("ConfigChanged(default)", |e| {
+            matches!(e, ProviderEvent::ConfigChanged { permission_mode: Some(m), .. } if m == "default")
+        })
+        .await;
     assert_eq!(
         events.count(|e| matches!(e, ProviderEvent::ConfigChanged { .. })),
-        2
+        3
     );
     shutdown(session, &mut events).await;
     h.save_fixtures(&["main"]);
@@ -394,6 +404,39 @@ pub async fn exit_during_control(h: &Harness) {
         session.send_prompt("hi").await,
         Err(SessionError::Exited)
     ));
+}
+
+/// A question card can be dismissed (denied) without interrupting the whole turn.
+pub async fn dismiss_question(h: &Harness) {
+    let cwd = h.workdir("a");
+    let (session, mut events) = h.spawn("main", &cwd).await;
+    session
+        .send_prompt("Use the AskUserQuestion tool to ask me which color I prefer, red or blue. If I don't answer, reply with only the word SKIPPED.")
+        .await
+        .unwrap();
+    let id = match events
+        .until("QuestionsRequested", |e| {
+            matches!(e, ProviderEvent::QuestionsRequested { .. })
+        })
+        .await
+    {
+        ProviderEvent::QuestionsRequested { interaction_id, .. } => interaction_id,
+        _ => unreachable!(),
+    };
+    session
+        .respond_approval(
+            &id,
+            ApprovalDecision::Deny {
+                message: "The user dismissed the question.".into(),
+                interrupt: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.turn_completed().await.0, TurnStatus::Completed);
+    assert!(resolved(&events, &id, Resolution::Denied));
+    shutdown(session, &mut events).await;
+    h.save_fixtures(&["main"]);
 }
 
 /// "Deny and stop": the turn ends as an interrupt the user asked for, not a failure.

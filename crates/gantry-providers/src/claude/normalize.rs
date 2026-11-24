@@ -155,11 +155,18 @@ impl Normalizer {
     pub fn ingest(&mut self, frame: &Value) -> Vec<ProviderEvent> {
         let kind = str_field(frame, "type").unwrap_or("");
         // Frames that only occur inside a turn: attribute them even if Claude started it.
+        // Only `can_use_tool` control requests belong to a turn: other kinds (hooks, SDK MCP)
+        // are answered with an error and get no `result`, so they must not open a turn that
+        // would then never close.
         let mut out = Vec::new();
-        if matches!(
-            kind,
-            "stream_event" | "assistant" | "user" | "control_request" | "result"
-        ) {
+        let in_turn = match kind {
+            "stream_event" | "assistant" | "user" | "result" => true,
+            "control_request" => {
+                frame.pointer("/request/subtype").and_then(Value::as_str) == Some("can_use_tool")
+            }
+            _ => false,
+        };
+        if in_turn {
             self.ensure_turn(&mut out);
         }
         out.extend(self.ingest_frame(kind, frame));
@@ -518,6 +525,18 @@ mod tests {
         assert_eq!(
             completed(&events),
             Some(("agent-turn-1".into(), TurnStatus::Completed))
+        );
+        assert_eq!(n.active_turn(), None);
+    }
+
+    #[test]
+    fn unsupported_control_request_while_idle_opens_no_turn() {
+        let mut n = Normalizer::new();
+        let events = n.ingest(&json!({"type":"control_request","request_id":"h1",
+            "request":{"subtype":"hook_callback"}}));
+        assert!(
+            matches!(&events[..], [ProviderEvent::Other { .. }]),
+            "{events:?}"
         );
         assert_eq!(n.active_turn(), None);
     }

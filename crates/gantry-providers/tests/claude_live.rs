@@ -27,4 +27,5 @@ live!(
     live_config,
     resume_fork_cross_cwd,
     deny_and_stop,
+    dismiss_question,
 );

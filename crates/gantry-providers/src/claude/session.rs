@@ -2,7 +2,8 @@
 //!
 //! One actor task owns the [`ManagedChild`]; a reader task frames stdout; all writes go through
 //! the cloneable [`StdinWriter`]. Shared state lives behind a short-held std mutex that is never
-//! held across an `.await`.
+//! held across an `.await`. Events are emitted *while holding* that mutex, so the stream is
+//! totally ordered with the state transitions that produced it.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -26,6 +27,8 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Shutdown: interrupt a running turn, close stdin (EOF is the stream-json stop), then kill the
 /// tree if the worker has not exited after this long.
 const SHUTDOWN_KILL_AFTER: Duration = Duration::from_secs(5);
+/// Consecutive stdout read errors after which the stream is treated as closed.
+const MAX_CONSECUTIVE_READ_ERRORS: u32 = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -39,7 +42,7 @@ pub enum SessionError {
     UnknownInteraction(String),
     #[error("interaction `{0}` is not a question")]
     NotAQuestion(String),
-    #[error("interaction `{0}` is a question: answer it with answer_questions")]
+    #[error("interaction `{0}` is a question: answer it with answer_questions (or deny it)")]
     IsAQuestion(String),
     #[error("claude rejected `{request}`: {message}")]
     Rejected {
@@ -63,11 +66,23 @@ struct State {
     native_session_id: String,
     next_turn: u64,
     exited: bool,
+    /// The only sender of the event stream: dropped on termination so the stream ends.
+    events: Option<mpsc::UnboundedSender<ProviderEvent>>,
+}
+
+impl State {
+    fn emit(&mut self, events: Vec<ProviderEvent>) {
+        if let Some(tx) = &self.events {
+            for event in events {
+                // A dropped receiver just means nobody is listening anymore.
+                let _ = tx.send(event);
+            }
+        }
+    }
 }
 
 struct Shared {
     state: Mutex<State>,
-    events: mpsc::UnboundedSender<ProviderEvent>,
     raw_log: Option<Mutex<std::fs::File>>,
     next_request: AtomicU64,
 }
@@ -77,17 +92,45 @@ impl Shared {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn emit(&self, events: Vec<ProviderEvent>) {
-        for event in events {
-            // A dropped receiver just means nobody is listening anymore.
-            let _ = self.events.send(event);
-        }
-    }
-
     fn log_frame(&self, dir: &str, frame: &Value) {
-        if let Some(log) = &self.raw_log {
-            let mut file = log.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = writeln!(file, "{}", json!({ "dir": dir, "frame": frame }));
+        let Some(log) = &self.raw_log else {
+            return;
+        };
+        // The initialize response carries account details: keep them out of diagnostic logs.
+        let mut frame = frame.clone();
+        if let Some(payload) = frame
+            .pointer_mut("/response/response")
+            .and_then(Value::as_object_mut)
+        {
+            payload.remove("account");
+        }
+        let mut file = log.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = writeln!(file, "{}", json!({ "dir": dir, "frame": frame }));
+    }
+}
+
+/// Removes a pending control request if its waiter goes away (timeout / cancelled future).
+struct PendingControl<'a> {
+    shared: &'a Shared,
+    id: String,
+}
+
+impl Drop for PendingControl<'_> {
+    fn drop(&mut self) {
+        self.shared.lock().pending_controls.remove(&self.id);
+    }
+}
+
+/// Clears the interrupt flag unless the interrupt request was delivered and acknowledged.
+struct InterruptFlag<'a> {
+    shared: &'a Shared,
+    acknowledged: bool,
+}
+
+impl Drop for InterruptFlag<'_> {
+    fn drop(&mut self) {
+        if !self.acknowledged {
+            self.shared.lock().normalizer.clear_interrupt_requested();
         }
     }
 }
@@ -108,7 +151,7 @@ pub struct ClaudeSession {
 
 impl ClaudeSession {
     /// Starts the worker, performs the `initialize` handshake, and returns the session plus
-    /// its event stream. The stream ends after [`ProviderEvent::SessionTerminated`].
+    /// its event stream. The stream ends right after [`ProviderEvent::SessionTerminated`].
     pub async fn spawn(
         config: ClaudeConfig,
     ) -> Result<(ClaudeSession, mpsc::UnboundedReceiver<ProviderEvent>)> {
@@ -155,8 +198,8 @@ impl ClaudeSession {
                 native_session_id: String::new(),
                 next_turn: 0,
                 exited: false,
+                events: Some(events_tx),
             }),
-            events: events_tx,
             raw_log,
             next_request: AtomicU64::new(0),
         });
@@ -166,9 +209,10 @@ impl ClaudeSession {
             .expect("stdin is piped and not yet taken");
         if let Some(stderr) = child.stderr.take() {
             let sink = Arc::clone(&shared);
-            // Detached: the drain ends at EOF when the process exits.
+            // Detached: the drain ends at EOF when the process exits; lines after termination
+            // are dropped because the event sender is gone by then.
             drop(StderrTail::spawn(stderr, 200, move |line| {
-                sink.emit(vec![ProviderEvent::ProviderStderr {
+                sink.lock().emit(vec![ProviderEvent::ProviderStderr {
                     line: line.to_owned(),
                 }]);
             }));
@@ -192,7 +236,7 @@ impl ClaudeSession {
         let init = session.control("initialize", wire::initialize()).await?;
         // Only selected fields: the response also carries account details, which must not
         // travel further than this adapter.
-        session.shared.emit(vec![ProviderEvent::Initialized {
+        session.shared.lock().emit(vec![ProviderEvent::Initialized {
             version: init
                 .get("claude_code_version")
                 .and_then(Value::as_str)
@@ -210,6 +254,7 @@ impl ClaudeSession {
         self.shared.lock().native_session_id.clone()
     }
 
+    /// The running turn — Gantry's (`turn-N`) or one Claude started itself (`agent-turn-N`).
     pub fn active_turn(&self) -> Option<TurnId> {
         self.shared.lock().normalizer.active_turn().cloned()
     }
@@ -234,18 +279,17 @@ impl ClaudeSession {
             state.next_turn += 1;
             let turn_id = format!("turn-{}", state.next_turn);
             let events = state.normalizer.begin_turn(turn_id.clone());
-            self.shared.emit(events);
+            state.emit(events);
             let frame = wire::user_message(content, &state.native_session_id);
             (turn_id, frame)
         };
         if let Err(e) = self.write(&frame).await {
             // Claude never received it: don't leave a phantom turn open.
-            let events = self
-                .shared
-                .lock()
+            let mut state = self.shared.lock();
+            let events = state
                 .normalizer
                 .abort_turn(&turn_id, "the prompt could not be delivered to claude");
-            self.shared.emit(events);
+            state.emit(events);
             return Err(e);
         }
         Ok(turn_id)
@@ -260,31 +304,24 @@ impl ClaudeSession {
             }
             state.normalizer.note_interrupt_requested();
         }
-        let result = self.control("interrupt", wire::interrupt()).await.map(drop);
-        if result.is_err() {
-            // It never took effect; don't label the turn's eventual end as an interrupt.
-            self.shared.lock().normalizer.clear_interrupt_requested();
-        }
-        result
+        // If the request fails *or this future is dropped* (e.g. a caller's timeout), the
+        // interrupt never took effect: don't label the turn's eventual end as one.
+        let mut flag = InterruptFlag {
+            shared: &self.shared,
+            acknowledged: false,
+        };
+        self.control("interrupt", wire::interrupt()).await?;
+        flag.acknowledged = true;
+        Ok(())
     }
 
-    /// Answers a tool / plan approval.
+    /// Answers a tool / plan approval. A question card can be *denied* here (dismissed);
+    /// answering it goes through [`ClaudeSession::answer_questions`].
     pub async fn respond_approval(
         &self,
         interaction_id: &str,
         decision: ApprovalDecision,
     ) -> Result<()> {
-        let pending = self
-            .shared
-            .lock()
-            .normalizer
-            .pending(interaction_id)
-            .cloned()
-            .ok_or_else(|| SessionError::UnknownInteraction(interaction_id.to_owned()))?;
-        if pending.tool_name == ASK_USER_QUESTION {
-            // An "allow" without answers would run the question tool with nothing chosen.
-            return Err(SessionError::IsAQuestion(interaction_id.to_owned()));
-        }
         let stops_turn = matches!(
             decision,
             ApprovalDecision::Deny {
@@ -292,36 +329,51 @@ impl ClaudeSession {
                 ..
             }
         );
-        let (frame, resolution) = match decision {
-            ApprovalDecision::Allow {
-                updated_input,
-                remember,
-            } => (
-                wire::allow(
-                    interaction_id,
-                    updated_input.unwrap_or(pending.input),
-                    &remember,
+        // Resolve *before* writing, under the lock: once the response is on the wire Claude can
+        // finish the turn immediately, and that must not cancel the interaction first. This
+        // also makes a double answer fail with UnknownInteraction instead of answering twice.
+        let frame = {
+            let mut state = self.shared.lock();
+            let pending = state
+                .normalizer
+                .pending(interaction_id)
+                .cloned()
+                .ok_or_else(|| SessionError::UnknownInteraction(interaction_id.to_owned()))?;
+            let (frame, resolution) = match decision {
+                ApprovalDecision::Allow { .. } if pending.tool_name == ASK_USER_QUESTION => {
+                    // An "allow" without answers would run the question tool with nothing chosen.
+                    return Err(SessionError::IsAQuestion(interaction_id.to_owned()));
+                }
+                ApprovalDecision::Allow {
+                    updated_input,
+                    remember,
+                } => (
+                    wire::allow(
+                        interaction_id,
+                        updated_input.unwrap_or(pending.input),
+                        &remember,
+                    ),
+                    Resolution::Approved,
                 ),
-                Resolution::Approved,
-            ),
-            ApprovalDecision::Deny { message, interrupt } => (
-                wire::deny(interaction_id, &message, interrupt),
-                Resolution::Denied,
-            ),
+                ApprovalDecision::Deny { message, interrupt } => (
+                    wire::deny(interaction_id, &message, interrupt),
+                    Resolution::Denied,
+                ),
+            };
+            if stops_turn {
+                // "Deny and stop" ends the turn with an error result: that's an interrupt the
+                // user asked for, not an agent failure.
+                state.normalizer.note_interrupt_requested();
+            }
+            let events = state.normalizer.resolve(interaction_id, resolution);
+            state.emit(events);
+            frame
         };
-        if stops_turn {
-            // "Deny and stop" ends the turn with an error result: that's an interrupt the
-            // user asked for, not an agent failure.
-            self.shared.lock().normalizer.note_interrupt_requested();
+        let written = self.write(&frame).await;
+        if written.is_err() && stops_turn {
+            self.shared.lock().normalizer.clear_interrupt_requested();
         }
-        self.write(&frame).await?;
-        let events = self
-            .shared
-            .lock()
-            .normalizer
-            .resolve(interaction_id, resolution);
-        self.shared.emit(events);
-        Ok(())
+        written
     }
 
     /// Answers an `AskUserQuestion` card. `answers` maps question id (the question text for
@@ -331,36 +383,35 @@ impl ClaudeSession {
         interaction_id: &str,
         answers: impl IntoIterator<Item = (String, String)>,
     ) -> Result<()> {
-        let pending = self
-            .shared
-            .lock()
-            .normalizer
-            .pending(interaction_id)
-            .cloned()
-            .ok_or_else(|| SessionError::UnknownInteraction(interaction_id.to_owned()))?;
-        if pending.tool_name != ASK_USER_QUESTION {
-            return Err(SessionError::NotAQuestion(interaction_id.to_owned()));
-        }
-        let mut input = pending.input;
         let answers: serde_json::Map<String, Value> = answers
             .into_iter()
             .map(|(q, a)| (q, Value::String(a)))
             .collect();
-        let Some(obj) = input.as_object_mut() else {
-            // Never send an "allow" that silently drops the user's answers.
-            return Err(SessionError::Io(std::io::Error::other(
-                "AskUserQuestion input is not a JSON object",
-            )));
+        let frame = {
+            let mut state = self.shared.lock();
+            let pending = state
+                .normalizer
+                .pending(interaction_id)
+                .cloned()
+                .ok_or_else(|| SessionError::UnknownInteraction(interaction_id.to_owned()))?;
+            if pending.tool_name != ASK_USER_QUESTION {
+                return Err(SessionError::NotAQuestion(interaction_id.to_owned()));
+            }
+            let mut input = pending.input;
+            let Some(obj) = input.as_object_mut() else {
+                // Never send an "allow" that silently drops the user's answers.
+                return Err(SessionError::Io(std::io::Error::other(
+                    "AskUserQuestion input is not a JSON object",
+                )));
+            };
+            obj.insert("answers".into(), Value::Object(answers));
+            let events = state
+                .normalizer
+                .resolve(interaction_id, Resolution::Answered);
+            state.emit(events);
+            wire::allow(interaction_id, input, &[])
         };
-        obj.insert("answers".into(), Value::Object(answers));
-        self.write(&wire::allow(interaction_id, input, &[])).await?;
-        let events = self
-            .shared
-            .lock()
-            .normalizer
-            .resolve(interaction_id, Resolution::Answered);
-        self.shared.emit(events);
-        Ok(())
+        self.write(&frame).await
     }
 
     /// Switches the model live. Returns the model Claude resolved (e.g. `sonnet` → full id).
@@ -371,14 +422,14 @@ impl ClaudeSession {
             .and_then(Value::as_str)
             .unwrap_or(model)
             .to_owned();
-        self.shared.emit(vec![ProviderEvent::ConfigChanged {
+        self.shared.lock().emit(vec![ProviderEvent::ConfigChanged {
             model: Some(resolved.clone()),
             permission_mode: None,
         }]);
         Ok(resolved)
     }
 
-    /// Switches the permission mode live.
+    /// Switches the permission mode live (`Manual` is accepted and reported back as `default`).
     pub async fn set_permission_mode(&self, mode: PermissionMode) -> Result<()> {
         let reply = self
             .control(
@@ -386,7 +437,7 @@ impl ClaudeSession {
                 wire::set_permission_mode(mode.as_cli()),
             )
             .await?;
-        self.shared.emit(vec![ProviderEvent::ConfigChanged {
+        self.shared.lock().emit(vec![ProviderEvent::ConfigChanged {
             model: None,
             permission_mode: Some(
                 reply
@@ -399,8 +450,8 @@ impl ClaudeSession {
         Ok(())
     }
 
-    /// Stops the worker: interrupts a running turn, then runs the process shutdown ladder
-    /// (EOF, then kill) and reaps any helpers it started.
+    /// Stops the worker: interrupts a running turn, then closes stdin (the stream-json stop)
+    /// and kills the tree if it hasn't exited in time; helpers it started are reaped.
     pub async fn shutdown(&self) -> Result<Shutdown> {
         if self.active_turn().is_some() {
             let _ = tokio::time::timeout(Duration::from_secs(2), self.interrupt()).await;
@@ -428,18 +479,18 @@ impl ClaudeSession {
             }
             state.pending_controls.insert(id.clone(), tx);
         }
-        if let Err(e) = self.write(&wire::control_request(&id, body)).await {
-            self.shared.lock().pending_controls.remove(&id);
-            return Err(e);
-        }
+        // Removes the entry however this function ends (answered, timed out, dropped).
+        let _pending = PendingControl {
+            shared: &self.shared,
+            id: id.clone(),
+        };
+        self.write(&wire::control_request(&id, body)).await?;
         match tokio::time::timeout(CONTROL_TIMEOUT, rx).await {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(message))) => Err(SessionError::Rejected { request, message }),
+            // Sender dropped: the process exited before answering.
             Ok(Err(_)) => Err(SessionError::Exited),
-            Err(_) => {
-                self.shared.lock().pending_controls.remove(&id);
-                Err(SessionError::Timeout { request })
-            }
+            Err(_) => Err(SessionError::Timeout { request }),
         }
     }
 
@@ -464,9 +515,22 @@ async fn run(
     let (lines_tx, mut lines) = mpsc::channel::<Line>(256);
     tokio::spawn(async move {
         let mut reader = LineReader::new(stdout, DEFAULT_MAX_LINE);
-        while let Ok(Some(line)) = reader.next_line().await {
-            if lines_tx.send(line).await.is_err() {
-                break;
+        // Tolerate transient read errors (the reader keeps a partial line across them); only
+        // EOF or a run of errors ends the session.
+        let mut consecutive_errors = 0;
+        loop {
+            match reader.next_line().await {
+                Ok(Some(line)) => {
+                    consecutive_errors = 0;
+                    if lines_tx.send(line).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) if consecutive_errors < MAX_CONSECUTIVE_READ_ERRORS => {
+                    consecutive_errors += 1;
+                }
+                Err(_) => break,
             }
         }
     });
@@ -480,7 +544,7 @@ async fn run(
         tokio::select! {
             line = lines.recv() => match line {
                 Some(Line::Text(text)) => handle_line(&shared, &writer, &text).await,
-                Some(Line::Oversized { len }) => shared.emit(vec![ProviderEvent::Other {
+                Some(Line::Oversized { len }) => shared.lock().emit(vec![ProviderEvent::Other {
                     kind: "oversized_line".into(),
                     frame: json!({ "bytes": len }),
                 }]),
@@ -530,22 +594,21 @@ async fn run(
         Ok(Some(status)) => Some(status.code()),
         _ => None,
     };
-    let (events, pending) = {
-        let mut state = shared.lock();
-        state.exited = true;
-        let events = state.normalizer.process_exited(exit_code);
-        (events, std::mem::take(&mut state.pending_controls))
-    };
+    let mut state = shared.lock();
+    state.exited = true;
+    let events = state.normalizer.process_exited(exit_code);
+    state.emit(events);
+    // End the event stream: no sender outlives termination.
+    state.events = None;
     // Dropping the senders makes waiting control requests fail with `SessionError::Exited`.
-    drop(pending);
-    shared.emit(events);
+    state.pending_controls.clear();
 }
 
 async fn handle_line(shared: &Shared, writer: &StdinWriter, text: &str) {
     let frame: Value = match serde_json::from_str(text) {
         Ok(frame) => frame,
         Err(_) => {
-            shared.emit(vec![ProviderEvent::Other {
+            shared.lock().emit(vec![ProviderEvent::Other {
                 kind: "non_json_output".into(),
                 frame: Value::String(text.to_owned()),
             }]);
@@ -561,8 +624,8 @@ async fn handle_line(shared: &Shared, writer: &StdinWriter, text: &str) {
                 .get("request_id")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let reply = shared.lock().pending_controls.remove(id);
-            match reply {
+            let mut state = shared.lock();
+            match state.pending_controls.remove(id) {
                 Some(reply) => {
                     let result =
                         if response.get("subtype").and_then(Value::as_str) == Some("success") {
@@ -576,7 +639,7 @@ async fn handle_line(shared: &Shared, writer: &StdinWriter, text: &str) {
                         };
                     let _ = reply.send(result);
                 }
-                None => shared.emit(vec![ProviderEvent::Other {
+                None => state.emit(vec![ProviderEvent::Other {
                     kind: "unmatched_control_response".into(),
                     frame: frame.clone(),
                 }]),
@@ -608,6 +671,41 @@ async fn handle_line(shared: &Shared, writer: &StdinWriter, text: &str) {
         _ => {}
     }
 
-    let events = shared.lock().normalizer.ingest(&frame);
-    shared.emit(events);
+    let mut state = shared.lock();
+    let events = state.normalizer.ingest(&frame);
+    state.emit(events);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Diagnostic raw logs never contain the initialize response's account details.
+    #[test]
+    fn raw_log_strips_account_details() {
+        let path =
+            std::env::temp_dir().join(format!("gantry-rawlog-{}.ndjson", std::process::id()));
+        let shared = Shared {
+            state: Mutex::new(State {
+                normalizer: Normalizer::new(),
+                pending_controls: HashMap::new(),
+                native_session_id: String::new(),
+                next_turn: 0,
+                exited: false,
+                events: None,
+            }),
+            raw_log: Some(Mutex::new(std::fs::File::create(&path).unwrap())),
+            next_request: AtomicU64::new(0),
+        };
+        shared.log_frame(
+            "out",
+            &json!({"type":"control_response","response":{"subtype":"success","request_id":"gantry-0",
+                "response":{"account":{"email":"someone@example.com"},"claude_code_version":"2.1.330"}}}),
+        );
+        drop(shared);
+        let logged = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!logged.contains("someone@example.com"), "{logged}");
+        assert!(logged.contains("2.1.330"));
+    }
 }

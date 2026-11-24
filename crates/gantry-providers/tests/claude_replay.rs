@@ -27,4 +27,5 @@ replay!(
     unsupported_control_request,
     exit_during_control,
     deny_and_stop,
+    dismiss_question,
 );
