@@ -61,8 +61,16 @@ fn main() {
                 writeln!(out, "{frame}").unwrap();
                 out.flush().unwrap();
             }
-            // Hand-written fixtures only: simulate the process dying at this point.
+            // Hand-written fixtures only: simulate the process dying at this point...
             Some("exit") => std::process::exit(record["code"].as_i64().unwrap_or(1) as i32),
+            // ...a slow reply...
+            Some("sleep") => std::thread::sleep(std::time::Duration::from_millis(
+                record["ms"].as_u64().unwrap_or(0),
+            )),
+            // ...or a diagnostic on stderr (e.g. a crash message).
+            Some("stderr") => {
+                eprintln!("{}", record["text"].as_str().unwrap_or(""));
+            }
             _ => {}
         }
     }

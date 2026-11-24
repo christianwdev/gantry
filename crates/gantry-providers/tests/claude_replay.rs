@@ -26,6 +26,8 @@ replay!(
     resume_fork_cross_cwd,
     unsupported_control_request,
     exit_during_control,
+    late_control_reply,
+    shutdown_busy_worker,
     deny_and_stop,
     dismiss_question,
 );

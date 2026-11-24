@@ -8,7 +8,11 @@ use super::{Events, Harness, Mode};
 
 async fn shutdown(session: ClaudeSession, events: &mut Events) {
     let t = std::time::Instant::now();
-    let outcome = session.shutdown().await.expect("shutdown");
+    let outcome = session
+        .shutdown()
+        .await
+        .expect("shutdown")
+        .expect("the worker was still running");
     assert!(
         outcome.tree_empty,
         "claude's process tree must be gone after shutdown"
@@ -437,6 +441,50 @@ pub async fn dismiss_question(h: &Harness) {
     assert!(resolved(&events, &id, Resolution::Denied));
     shutdown(session, &mut events).await;
     h.save_fixtures(&["main"]);
+}
+
+/// Replay-only: a control request whose waiter gave up (timeout / dropped future) but which
+/// Claude applies late is still reported as ConfigChanged.
+pub async fn late_control_reply(h: &Harness) {
+    let cwd = h.workdir("a");
+    let (session, mut events) = h.spawn("main", &cwd).await;
+    let gave_up = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        session.set_model("sonnet"),
+    )
+    .await;
+    assert!(gave_up.is_err(), "the fixture delays the reply");
+    events
+        .until("late ConfigChanged", |e| {
+            matches!(e, ProviderEvent::ConfigChanged { model: Some(m), .. } if m.contains("sonnet"))
+        })
+        .await;
+    shutdown(session, &mut events).await;
+}
+
+/// Replay-only: shutting down a busy worker reports the turn as Interrupted (not Crashed),
+/// delivers the process's last stderr line before termination, and a second shutdown is a
+/// no-op instead of an error.
+pub async fn shutdown_busy_worker(h: &Harness) {
+    let cwd = h.workdir("a");
+    let (session, mut events) = h.spawn("main", &cwd).await;
+    session.send_prompt("work").await.unwrap();
+    events
+        .until("ToolStarted", |e| {
+            matches!(e, ProviderEvent::ToolStarted { .. })
+        })
+        .await;
+    let _ = session.shutdown().await.expect("shutdown");
+    assert_eq!(events.turn_completed().await.0, TurnStatus::Interrupted);
+    events.terminated().await;
+    assert!(
+        events.seen.iter().any(|e| matches!(
+            e,
+            ProviderEvent::ProviderStderr { line } if line.contains("worker crashed while stopping")
+        )),
+        "the last stderr line must arrive before SessionTerminated"
+    );
+    assert!(matches!(session.shutdown().await, Ok(None)));
 }
 
 /// "Deny and stop": the turn ends as an interrupt the user asked for, not a failure.

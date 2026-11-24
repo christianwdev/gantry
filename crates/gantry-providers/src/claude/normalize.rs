@@ -28,7 +28,9 @@ pub struct PendingInteraction {
 #[derive(Debug, Default)]
 pub struct Normalizer {
     turn: Option<TurnId>,
-    interrupt_requested: bool,
+    /// The turn Gantry asked to interrupt (a flag bound to its turn, so a stale request for an
+    /// earlier turn can never affect a newer one).
+    interrupt_for: Option<TurnId>,
     /// Current streamed message id per subagent scope (`parent_tool_use_id`).
     message_ids: HashMap<Option<String>, String>,
     /// Streamed content blocks: (scope, index) -> (item id, block type).
@@ -58,21 +60,28 @@ impl Normalizer {
     /// Gantry sent a prompt: a new turn starts.
     pub fn begin_turn(&mut self, turn_id: TurnId) -> Vec<ProviderEvent> {
         self.turn = Some(turn_id.clone());
-        self.interrupt_requested = false;
+        self.interrupt_for = None;
         vec![ProviderEvent::TurnStarted { turn_id }]
     }
 
     /// Gantry asked to interrupt: an *error* `result` for this turn reads as `Interrupted`
     /// (a success that raced the interrupt still counts as `Completed`).
-    pub fn note_interrupt_requested(&mut self) {
-        if self.turn.is_some() {
-            self.interrupt_requested = true;
+    /// Returns the turn the flag was set for.
+    pub fn note_interrupt_requested(&mut self) -> Option<TurnId> {
+        self.interrupt_for = self.turn.clone();
+        self.interrupt_for.clone()
+    }
+
+    /// The interrupt for `turn_id` was rejected: it never took effect. No-op if the flag now
+    /// belongs to another turn.
+    pub fn clear_interrupt_requested(&mut self, turn_id: &str) {
+        if self.interrupt_for.as_deref() == Some(turn_id) {
+            self.interrupt_for = None;
         }
     }
 
-    /// The interrupt request failed (rejected / timed out): it never took effect.
-    pub fn clear_interrupt_requested(&mut self) {
-        self.interrupt_requested = false;
+    fn interrupted(&self) -> bool {
+        self.turn.is_some() && self.interrupt_for == self.turn
     }
 
     /// The prompt for `turn_id` could not be delivered: end that turn as `Failed`.
@@ -81,7 +90,7 @@ impl Normalizer {
             return Vec::new();
         }
         self.turn = None;
-        self.interrupt_requested = false;
+        self.interrupt_for = None;
         vec![ProviderEvent::TurnCompleted {
             turn_id: turn_id.to_owned(),
             status: TurnStatus::Failed,
@@ -101,7 +110,7 @@ impl Normalizer {
             self.agent_turns += 1;
             let turn_id = format!("agent-turn-{}", self.agent_turns);
             self.turn = Some(turn_id.clone());
-            self.interrupt_requested = false;
+            self.interrupt_for = None;
             out.push(ProviderEvent::TurnStarted { turn_id });
         }
     }
@@ -121,13 +130,15 @@ impl Normalizer {
         }
     }
 
-    /// The process exited. A turn still running ends as `Crashed` (or `Interrupted` if Gantry
-    /// had asked for that), and open interactions are cancelled.
-    pub fn process_exited(&mut self, exit_code: Option<u32>) -> Vec<ProviderEvent> {
+    /// The session ended (`reason`, e.g. the process exited or stdout failed). A turn still
+    /// running ends as `Crashed` (or `Interrupted` if Gantry had asked for that), and open
+    /// interactions are cancelled.
+    pub fn process_exited(&mut self, exit_code: Option<u32>, reason: &str) -> Vec<ProviderEvent> {
         let mut out = self.cancel_open_interactions();
         self.clear_turn_scratch();
+        let interrupted = self.interrupted();
         if let Some(turn_id) = self.turn.take() {
-            let status = if self.interrupt_requested {
+            let status = if interrupted {
                 TurnStatus::Interrupted
             } else {
                 TurnStatus::Crashed
@@ -146,7 +157,7 @@ impl Normalizer {
         }
         out.push(ProviderEvent::SessionTerminated {
             exit_code,
-            reason: "agent process exited".into(),
+            reason: reason.to_owned(),
         });
         out
     }
@@ -161,8 +172,11 @@ impl Normalizer {
         let mut out = Vec::new();
         let in_turn = match kind {
             "stream_event" | "assistant" | "user" | "result" => true,
+            // Mirrors control_request(): without a request_id it can't become an interaction
+            // (and no result would close the turn).
             "control_request" => {
                 frame.pointer("/request/subtype").and_then(Value::as_str) == Some("can_use_tool")
+                    && frame.get("request_id").and_then(Value::as_str).is_some()
             }
             _ => false,
         };
@@ -390,7 +404,7 @@ impl Normalizer {
             .unwrap_or(subtype != "success");
         // An interrupt ends the turn with an error result; a *success* that raced a late
         // interrupt request is still a completed turn.
-        let status = match (is_error, self.interrupt_requested) {
+        let status = match (is_error, self.interrupted()) {
             (true, true) => TurnStatus::Interrupted,
             (true, false) => TurnStatus::Failed,
             (false, _) => TurnStatus::Completed,
@@ -415,7 +429,7 @@ impl Normalizer {
             usage: frame.get("usage").cloned(),
             cost_usd: frame.get("total_cost_usd").and_then(Value::as_f64),
         });
-        self.interrupt_requested = false;
+        self.interrupt_for = None;
         self.clear_turn_scratch();
         out
     }
@@ -556,13 +570,34 @@ mod tests {
             n.ingest(&json!({"type":"result","subtype":"error_during_execution","is_error":true}));
         assert_eq!(completed(&events).unwrap().1, TurnStatus::Interrupted);
 
-        // A failed interrupt request is forgotten: the error is a real failure.
+        // A rejected interrupt request is forgotten: the error is a real failure.
         n.begin_turn("turn-3".into());
         n.note_interrupt_requested();
-        n.clear_interrupt_requested();
+        n.clear_interrupt_requested("turn-3");
         let events =
             n.ingest(&json!({"type":"result","subtype":"error_during_execution","is_error":true}));
         assert_eq!(completed(&events).unwrap().1, TurnStatus::Failed);
+    }
+
+    #[test]
+    fn stale_interrupt_failure_cannot_clear_a_newer_turns_flag() {
+        let mut n = Normalizer::new();
+        n.begin_turn("turn-1".into());
+        n.note_interrupt_requested();
+        n.ingest(&json!({"type":"result","subtype":"error_during_execution","is_error":true}));
+        n.begin_turn("turn-2".into());
+        assert_eq!(n.note_interrupt_requested().as_deref(), Some("turn-2"));
+        n.clear_interrupt_requested("turn-1"); // late rejection of turn-1's request
+        let events =
+            n.ingest(&json!({"type":"result","subtype":"error_during_execution","is_error":true}));
+        assert_eq!(completed(&events).unwrap().1, TurnStatus::Interrupted);
+    }
+
+    #[test]
+    fn can_use_tool_without_request_id_opens_no_turn() {
+        let mut n = Normalizer::new();
+        n.ingest(&json!({"type":"control_request","request":{"subtype":"can_use_tool"}}));
+        assert_eq!(n.active_turn(), None);
     }
 
     #[test]

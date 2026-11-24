@@ -166,8 +166,14 @@ fn sanitize_record(mut record: Value, root: &Path) -> Value {
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let usable = |s: String| if s.len() >= 3 { s } else { String::new() };
-    let (account, folder) = (usable(account), usable(folder));
+    // A name this short can't be scrubbed without mangling unrelated text: refuse to record
+    // rather than silently commit it to a public repo.
+    for name in [&account, &folder] {
+        assert!(
+            name.chars().count() >= 3,
+            "username `{name}` is too short to scrub from fixtures safely; record elsewhere"
+        );
+    }
     // Longest first, so "Alexandra" isn't half-replaced by "Alex".
     let mut names = [account, folder];
     names.sort_by_key(|n| std::cmp::Reverse(n.len()));
@@ -183,12 +189,14 @@ fn sanitize_record(mut record: Value, root: &Path) -> Value {
     record
 }
 
+/// Case-insensitive replacement: Windows paths and names come back in any case
+/// (`C:\Users\X` vs `c:\users\x`).
 fn replace_strings(v: &mut Value, pairs: &[(&str, &str)]) {
     match v {
         Value::String(s) => {
             for (from, to) in pairs {
-                if !from.is_empty() && s.contains(from) {
-                    *s = s.replace(from, to);
+                if !from.is_empty() {
+                    *s = replace_ci(s, from, to);
                 }
             }
         }
@@ -196,6 +204,24 @@ fn replace_strings(v: &mut Value, pairs: &[(&str, &str)]) {
         Value::Object(o) => o.values_mut().for_each(|x| replace_strings(x, pairs)),
         _ => {}
     }
+}
+
+fn replace_ci(haystack: &str, needle: &str, with: &str) -> String {
+    let lower_hay = haystack.to_lowercase();
+    let lower_needle = needle.to_lowercase();
+    // Lower-casing can change byte lengths for non-ASCII text; fall back to exact matching then.
+    if lower_hay.len() != haystack.len() || lower_needle.len() != needle.len() {
+        return haystack.replace(needle, with);
+    }
+    let mut out = String::with_capacity(haystack.len());
+    let mut rest = 0;
+    for (at, _) in lower_hay.match_indices(&lower_needle) {
+        out.push_str(&haystack[rest..at]);
+        out.push_str(with);
+        rest = at + needle.len();
+    }
+    out.push_str(&haystack[rest..]);
+    out
 }
 
 pub struct Events {
